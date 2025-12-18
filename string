@@ -1,0 +1,32 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "课时记"
+    },
+    {
+      "name": "motion_permission_reason",
+      "value": "用于识别您单手握持手机的姿态，以便自动调整新建待办按钮的位置，方便您操作。"
+    },
+    {
+      "name": "shortcut_add_course",
+      "value": "排一节课"
+    },
+    {
+      "name": "shortcut_add_student",
+      "value": "添加学生"
+    },
+    {
+      "name": "shortcut_add_todo",
+      "value": "新建待办"
+    }
+  ]
+}
