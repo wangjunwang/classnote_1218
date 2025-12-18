@@ -1,0 +1,427 @@
+// entry/src/main/ets/db/DBHelper.ts
+import { relationalStore } from '@kit.ArkData';
+import { common } from '@kit.AbilityKit';
+
+// =======================
+// 数据类型定义
+// =======================
+export interface Student {
+  id: number;
+  name: string;
+  totalCredits: number;
+  usedCredits: number;
+  groupName: string; // 【新增】分组名称字段
+}
+
+export interface CourseRecord {
+  type: 'course';
+  id: number;
+  studentId: number;
+  studentName: string;
+  date: number;
+  note: string;
+  isFinished: number;
+}
+
+export interface InspirationRecord {
+  type: 'inspiration';
+  id: number;
+  date: number;
+  content: string;
+}
+
+export interface TodoRecord {
+  id: number;
+  date: number;
+  content: string;
+  isFinished: number; // 0: 未完成, 1: 已完成
+}
+
+export type DailyItem = CourseRecord | InspirationRecord;
+
+export interface MonthMarkers {
+  courses: number[];
+  inspirations: number[];
+}
+
+// =======================
+// 数据库帮助类
+// =======================
+export class DBHelper {
+  private rdbStore: relationalStore.RdbStore | null = null;
+  private tableNameStudent = 'student';
+  private tableNameCourse = 'course_record';
+  private tableNameInspiration = 'inspiration_record';
+  private tableNameTodo = 'todo_record';
+
+  // 【核心修改】统一发送全局数据更新通知
+  private notifyDataChange() {
+    AppStorage.setOrCreate('AppGlobalUpdate', Date.now());
+  }
+
+  async initDB(context: common.UIAbilityContext): Promise<void> {
+    const config = {
+      name: 'ClassNote.db',
+      securityLevel: relationalStore.SecurityLevel.S1
+    } as relationalStore.StoreConfig;
+
+    try {
+      this.rdbStore = await relationalStore.getRdbStore(context, config);
+      await this.createTables();
+      await this.upgradeTables(); // 【新增】检查并执行数据库字段升级
+    } catch (err) {
+      console.error(`DB init failed: ${JSON.stringify(err)}`);
+    }
+  }
+
+  private async createTables() {
+    if (!this.rdbStore) return;
+
+    // 【修改】建表语句中增加 groupName 字段，默认为 '默认分组'
+    await this.rdbStore.executeSql(`CREATE TABLE IF NOT EXISTS ${this.tableNameStudent} (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      totalCredits INTEGER DEFAULT 0,
+      usedCredits INTEGER DEFAULT 0,
+      groupName TEXT DEFAULT '默认分组'
+    )`);
+
+    await this.rdbStore.executeSql(`CREATE TABLE IF NOT EXISTS ${this.tableNameCourse} (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      studentId INTEGER,
+      date INTEGER,
+      note TEXT,
+      isFinished INTEGER DEFAULT 0
+    )`);
+
+    await this.rdbStore.executeSql(`CREATE TABLE IF NOT EXISTS ${this.tableNameInspiration} (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date INTEGER,
+      content TEXT
+    )`);
+
+    await this.rdbStore.executeSql(`CREATE TABLE IF NOT EXISTS ${this.tableNameTodo} (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date INTEGER,
+      content TEXT,
+      isFinished INTEGER DEFAULT 0
+    )`);
+  }
+
+  // 【新增】处理老版本数据库的字段升级
+  // 如果是已安装应用的用户，表已经存在但没有 groupName 字段，需要动态添加
+  private async upgradeTables() {
+    if (!this.rdbStore) return;
+    try {
+      // 尝试给 student 表添加 groupName 列
+      // 如果列已存在，SQLite 会报错，我们捕获这个错误即可忽略
+      await this.rdbStore.executeSql(`ALTER TABLE ${this.tableNameStudent} ADD COLUMN groupName TEXT DEFAULT '默认分组'`);
+      console.info('DBHelper: groupName column added successfully.');
+    } catch (e) {
+      // 如果报错说明列可能已存在，忽略错误
+      console.info('DBHelper: groupName column likely exists or add failed: ' + JSON.stringify(e));
+    }
+  }
+
+  // =======================
+  // 学生管理
+  // =======================
+  async getStudents(): Promise<Student[]> {
+    if (!this.rdbStore) return [];
+    const predicates = new relationalStore.RdbPredicates(this.tableNameStudent);
+    const resultSet = await this.rdbStore.query(predicates);
+    const students: Student[] = [];
+    while (resultSet.goToNextRow()) {
+      // 安全获取 groupName，防止老数据读取异常
+      let gName = '默认分组';
+      try {
+        const colIndex = resultSet.getColumnIndex('groupName');
+        if (colIndex !== -1) {
+          gName = resultSet.getString(colIndex) || '默认分组';
+        }
+      } catch (e) { }
+
+      students.push({
+        id: resultSet.getLong(resultSet.getColumnIndex('id')),
+        name: resultSet.getString(resultSet.getColumnIndex('name')),
+        totalCredits: resultSet.getLong(resultSet.getColumnIndex('totalCredits')),
+        usedCredits: resultSet.getLong(resultSet.getColumnIndex('usedCredits')),
+        groupName: gName // 【新增】读取字段
+      });
+    }
+    resultSet.close();
+    return students;
+  }
+
+  // 【修改】增加 groupName 参数，默认值为 '默认分组'
+  async addStudent(name: string, totalCredits: number = 0, groupName: string = '默认分组'): Promise<number> {
+    if (!this.rdbStore) return -1;
+    const valueBucket = {
+      name: name,
+      totalCredits: totalCredits,
+      usedCredits: 0,
+      groupName: groupName // 【新增】写入字段
+    } as relationalStore.ValuesBucket;
+    const ret = await this.rdbStore.insert(this.tableNameStudent, valueBucket);
+    this.notifyDataChange();
+    return ret;
+  }
+
+  async deleteStudent(id: number): Promise<void> {
+    if (!this.rdbStore) return;
+    const predicates = new relationalStore.RdbPredicates(this.tableNameStudent);
+    predicates.equalTo('id', id);
+    await this.rdbStore.delete(predicates);
+    this.notifyDataChange();
+  }
+
+  async getStudentNameById(id: number): Promise<string> {
+    if (!this.rdbStore) return '未知学生';
+    const predicates = new relationalStore.RdbPredicates(this.tableNameStudent);
+    predicates.equalTo('id', id);
+    const resultSet = await this.rdbStore.query(predicates);
+    let name = '未知学生';
+    if (resultSet.goToFirstRow()) {
+      name = resultSet.getString(resultSet.getColumnIndex('name'));
+    }
+    resultSet.close();
+    return name;
+  }
+
+  async topUpCredits(studentId: number, amount: number): Promise<void> {
+    if (!this.rdbStore) return;
+    const predicates = new relationalStore.RdbPredicates(this.tableNameStudent);
+    predicates.equalTo('id', studentId);
+    const resultSet = await this.rdbStore.query(predicates);
+    if (resultSet.goToFirstRow()) {
+      const currentTotal = resultSet.getLong(resultSet.getColumnIndex('totalCredits'));
+      const newTotal = currentTotal + amount;
+      const valueBucket = { totalCredits: newTotal } as relationalStore.ValuesBucket;
+      await this.rdbStore.update(valueBucket, predicates);
+      this.notifyDataChange();
+    }
+    resultSet.close();
+  }
+
+  // =======================
+  // 课程管理 (保持不变)
+  // =======================
+  async addCourse(studentId: number, date: number, note: string): Promise<number> {
+    if (!this.rdbStore) return -1;
+    const valueBucket = {
+      studentId: studentId,
+      date: date,
+      note: note,
+      isFinished: 0
+    } as relationalStore.ValuesBucket;
+    const ret = await this.rdbStore.insert(this.tableNameCourse, valueBucket);
+    this.notifyDataChange();
+    return ret;
+  }
+
+  async getCoursesByDate(start: number, end: number): Promise<CourseRecord[]> {
+    if (!this.rdbStore) return [];
+    const predicates = new relationalStore.RdbPredicates(this.tableNameCourse);
+    predicates.between('date', start, end);
+    const resultSet = await this.rdbStore.query(predicates);
+    const courses: CourseRecord[] = [];
+    while (resultSet.goToNextRow()) {
+      const studentId = resultSet.getLong(resultSet.getColumnIndex('studentId'));
+      const studentName = await this.getStudentNameById(studentId);
+      courses.push({
+        type: 'course',
+        id: resultSet.getLong(resultSet.getColumnIndex('id')),
+        studentId: studentId,
+        studentName: studentName,
+        date: resultSet.getLong(resultSet.getColumnIndex('date')),
+        note: resultSet.getString(resultSet.getColumnIndex('note')),
+        isFinished: resultSet.getLong(resultSet.getColumnIndex('isFinished'))
+      });
+    }
+    resultSet.close();
+    return courses;
+  }
+
+  async getStudentCourses(studentId: number): Promise<CourseRecord[]> {
+    if (!this.rdbStore) return [];
+    const predicates = new relationalStore.RdbPredicates(this.tableNameCourse);
+    predicates.equalTo('studentId', studentId);
+    predicates.orderByDesc('date');
+    const resultSet = await this.rdbStore.query(predicates);
+    const courses: CourseRecord[] = [];
+    const studentName = await this.getStudentNameById(studentId);
+    while (resultSet.goToNextRow()) {
+      courses.push({
+        type: 'course',
+        id: resultSet.getLong(resultSet.getColumnIndex('id')),
+        studentId: studentId,
+        studentName: studentName,
+        date: resultSet.getLong(resultSet.getColumnIndex('date')),
+        note: resultSet.getString(resultSet.getColumnIndex('note')),
+        isFinished: resultSet.getLong(resultSet.getColumnIndex('isFinished'))
+      });
+    }
+    resultSet.close();
+    return courses;
+  }
+
+  async deleteCourse(id: number): Promise<void> {
+    if (!this.rdbStore) return;
+    const predicates = new relationalStore.RdbPredicates(this.tableNameCourse);
+    predicates.equalTo('id', id);
+    await this.rdbStore.delete(predicates);
+    this.notifyDataChange();
+  }
+
+  async finishCourse(id: number, studentId: number): Promise<void> {
+    if (!this.rdbStore) return;
+
+    const coursePredicates = new relationalStore.RdbPredicates(this.tableNameCourse);
+    coursePredicates.equalTo('id', id);
+    const valueBucket = { isFinished: 1 } as relationalStore.ValuesBucket;
+    await this.rdbStore.update(valueBucket, coursePredicates);
+
+    const studentPredicates = new relationalStore.RdbPredicates(this.tableNameStudent);
+    studentPredicates.equalTo('id', studentId);
+    const resultSet = await this.rdbStore.query(studentPredicates);
+
+    if (resultSet.goToFirstRow()) {
+      const used = resultSet.getLong(resultSet.getColumnIndex('usedCredits'));
+      const newUsed = used + 1;
+      const studentUpdate = { usedCredits: newUsed } as relationalStore.ValuesBucket;
+      await this.rdbStore.update(studentUpdate, studentPredicates);
+    }
+    resultSet.close();
+    this.notifyDataChange();
+  }
+
+  // =======================
+  // 灵感管理 (保持不变)
+  // =======================
+  async addInspiration(date: number, content: string): Promise<number> {
+    if (!this.rdbStore) return -1;
+    const valueBucket = {
+      date: date,
+      content: content
+    } as relationalStore.ValuesBucket;
+    const ret = await this.rdbStore.insert(this.tableNameInspiration, valueBucket);
+    this.notifyDataChange();
+    return ret;
+  }
+
+  async getInspirationsByDate(start: number, end: number): Promise<InspirationRecord[]> {
+    if (!this.rdbStore) return [];
+    const predicates = new relationalStore.RdbPredicates(this.tableNameInspiration);
+    predicates.between('date', start, end);
+    const resultSet = await this.rdbStore.query(predicates);
+    const inspirations: InspirationRecord[] = [];
+    while (resultSet.goToNextRow()) {
+      inspirations.push({
+        type: 'inspiration',
+        id: resultSet.getLong(resultSet.getColumnIndex('id')),
+        date: resultSet.getLong(resultSet.getColumnIndex('date')),
+        content: resultSet.getString(resultSet.getColumnIndex('content'))
+      });
+    }
+    resultSet.close();
+    return inspirations;
+  }
+
+  async deleteInspiration(id: number): Promise<void> {
+    if (!this.rdbStore) return;
+    const predicates = new relationalStore.RdbPredicates(this.tableNameInspiration);
+    predicates.equalTo('id', id);
+    await this.rdbStore.delete(predicates);
+    this.notifyDataChange();
+  }
+
+  // =======================
+  // 待办事项管理 (保持不变)
+  // =======================
+  async addTodo(date: number, content: string): Promise<number> {
+    if (!this.rdbStore) return -1;
+    const valueBucket = {
+      date: date,
+      content: content,
+      isFinished: 0
+    } as relationalStore.ValuesBucket;
+    const ret = await this.rdbStore.insert(this.tableNameTodo, valueBucket);
+    this.notifyDataChange();
+    return ret;
+  }
+
+  async getTodosByDate(start: number, end: number): Promise<TodoRecord[]> {
+    if (!this.rdbStore) return [];
+    const predicates = new relationalStore.RdbPredicates(this.tableNameTodo);
+    predicates.between('date', start, end);
+    const resultSet = await this.rdbStore.query(predicates);
+    const todos: TodoRecord[] = [];
+    while (resultSet.goToNextRow()) {
+      todos.push({
+        id: resultSet.getLong(resultSet.getColumnIndex('id')),
+        date: resultSet.getLong(resultSet.getColumnIndex('date')),
+        content: resultSet.getString(resultSet.getColumnIndex('content')),
+        isFinished: resultSet.getLong(resultSet.getColumnIndex('isFinished'))
+      });
+    }
+    resultSet.close();
+    return todos;
+  }
+
+  async deleteTodo(id: number): Promise<void> {
+    if (!this.rdbStore) return;
+    const predicates = new relationalStore.RdbPredicates(this.tableNameTodo);
+    predicates.equalTo('id', id);
+    await this.rdbStore.delete(predicates);
+    this.notifyDataChange();
+  }
+
+  async updateTodoStatus(id: number, isFinished: number): Promise<void> {
+    if (!this.rdbStore) return;
+    const predicates = new relationalStore.RdbPredicates(this.tableNameTodo);
+    predicates.equalTo('id', id);
+    const valueBucket = { isFinished: isFinished } as relationalStore.ValuesBucket;
+    await this.rdbStore.update(valueBucket, predicates);
+    this.notifyDataChange();
+  }
+
+  // =======================
+  // 日历小红点 (保持不变)
+  // =======================
+  async getMonthMarkers(year: number, month: number): Promise<MonthMarkers> {
+    const result: MonthMarkers = { courses: [], inspirations: [] };
+    if (!this.rdbStore) return result;
+
+    const start = new Date(year, month - 1, 1).getTime();
+    const end = new Date(year, month, 0, 23, 59, 59).getTime();
+
+    // 查课程
+    const coursePredicates = new relationalStore.RdbPredicates(this.tableNameCourse);
+    coursePredicates.between('date', start, end);
+    const courseResultSet = await this.rdbStore.query(coursePredicates);
+    const courseDays = new Set<number>();
+    while (courseResultSet.goToNextRow()) {
+      const date = new Date(courseResultSet.getLong(courseResultSet.getColumnIndex('date')));
+      courseDays.add(date.getDate());
+    }
+    courseResultSet.close();
+
+    // 查灵感
+    const inspPredicates = new relationalStore.RdbPredicates(this.tableNameInspiration);
+    inspPredicates.between('date', start, end);
+    const inspResultSet = await this.rdbStore.query(inspPredicates);
+    const inspDays = new Set<number>();
+    while (inspResultSet.goToNextRow()) {
+      const date = new Date(inspResultSet.getLong(inspResultSet.getColumnIndex('date')));
+      inspDays.add(date.getDate());
+    }
+    inspResultSet.close();
+
+    return {
+      courses: Array.from<number>(courseDays),
+      inspirations: Array.from<number>(inspDays)
+    } as MonthMarkers;
+  }
+}
+
+export const dbHelper = new DBHelper();
