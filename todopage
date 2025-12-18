@@ -1,0 +1,439 @@
+// entry/src/main/ets/pages/TodoPage.ets
+import { dbHelper, TodoRecord } from '../db/DBHelper';
+import { common } from '@kit.AbilityKit';
+import { motion } from '@kit.MultimodalAwarenessKit';
+import { curves } from '@kit.ArkUI';
+import { NotificationHelper } from '../utils/NotificationHelper';
+
+// =======================
+// [自定义组件] 待办卡片
+// =======================
+@Component
+struct TodoItemCard {
+  @Prop item: TodoRecord
+
+  onToggle: () => void = () => {}
+  onDelete: () => void = () => {}
+
+  @Builder SwipeMenu() {
+    Row() {
+      Column() {
+        SymbolGlyph($r('sys.symbol.trash'))
+          .fontSize(22)
+          .fontColor([Color.White])
+      }
+      .width(44)
+      .height(44)
+      .borderRadius(22)
+      .backgroundColor(Color.Red)
+      .justifyContent(FlexAlign.Center)
+      .alignItems(HorizontalAlign.Center)
+      .shadow({ radius: 5, color: '#20FF0000', offsetY: 2 })
+      .onClick(() => {
+        this.onDelete()
+      })
+    }
+    .width(80)
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+  }
+
+  build() {
+    ListItem() {
+      Row() {
+        Stack({ alignContent: Alignment.Center }) {
+          Circle({ width: 24, height: 24 })
+            .fill(this.item.isFinished ? $r('app.color.accent') : 'transparent')
+            .stroke(this.item.isFinished ? $r('app.color.accent') : $r('app.color.text_secondary'))
+            .strokeWidth(2)
+
+          if (this.item.isFinished) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(14)
+              .fontColor([Color.White])
+          }
+        }
+        .width(30)
+        .height(30)
+        .alignContent(Alignment.Center)
+        .margin({ right: 15 })
+
+        Text(this.item.content)
+          .fontSize(16)
+          .fontColor(this.item.isFinished ? $r('app.color.text_secondary') : $r('app.color.text_primary'))
+          .decoration({
+            type: this.item.isFinished ? TextDecorationType.LineThrough : TextDecorationType.None,
+            color: $r('app.color.text_secondary')
+          })
+          .layoutWeight(1)
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .width('100%')
+      .padding(15)
+      .backgroundColor($r('app.color.card_bg'))
+      .borderRadius(16)
+    }
+    .onClick(() => { this.onToggle() })
+    .swipeAction({ end: this.SwipeMenu() })
+  }
+}
+
+// =======================
+// 1. 新建待办弹窗
+// =======================
+@CustomDialog
+struct AddTodoDialog {
+  controller: CustomDialogController
+  confirm: (content: string) => void = () => {}
+  @State content: string = ''
+  @State confirmButtonScale: number = 1.0;
+
+  build() {
+    Column({ space: 20 }) {
+      Text('新建待办').fontSize(20).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary')).width('100%').textAlign(TextAlign.Start).margin({ top: 10 })
+      TextInput({ placeholder: '要做什么？', text: this.content }).onChange(v => this.content = v)
+        .backgroundColor($r('app.color.input_bg')).fontColor($r('app.color.text_primary')).fontSize(16).height(50).borderRadius(8)
+      Row({ space: 20 }) {
+        Button('取消').backgroundColor($r('app.color.input_bg')).fontColor($r('app.color.text_secondary'))
+          .fontSize(16).onClick(() => { if(this.controller) this.controller.close() }).layoutWeight(1)
+
+        Button('保存').backgroundColor($r('app.color.accent'))
+          .fontSize(16).onClick(() => { if (this.content) { this.confirm(this.content); if (this.controller) this.controller.close() } }).layoutWeight(1)
+          .scale({ x: this.confirmButtonScale, y: this.confirmButtonScale })
+          .onTouch((event: TouchEvent) => {
+            animateTo({ duration: 100 }, () => {
+              if (event.type === TouchType.Down) {
+                this.confirmButtonScale = 0.9;
+              } else if (event.type === TouchType.Up) {
+                this.confirmButtonScale = 1.0;
+              }
+            });
+          })
+      }.width('100%')
+    }.padding(25).backgroundColor($r('app.color.card_bg')).borderRadius(16)
+  }
+}
+
+// =======================
+// 2. 待办清单主页面
+// =======================
+@Entry
+@Component
+export struct TodoPage {
+  @State unfinishedList: TodoRecord[] = []
+  @State finishedList: TodoRecord[] = []
+  @State selectedDate: Date = new Date()
+  @State totalCount: number = 0
+  @State finishedCount: number = 0
+
+  // 握持状态 (默认右手: true)
+  @State isRightHand: boolean = true
+
+  // 动画控制状态
+  @State opacityValue: number = 1;
+  @State offsetX: number = 0;
+
+  // 防抖定时器配置
+  private motionTimerId: number = -1;
+  private readonly DEBOUNCE_DELAY: number = 200; // 200ms 防抖
+
+  @StorageProp('AppGlobalUpdate') @Watch('refreshData') updateSignal: number = 0;
+
+  // 监听快捷方式动作
+  @StorageLink('GlobalShortcutAction') @Watch('onShortcutTrigger') shortcutAction: string = '';
+
+  // 【关键】防止重复触发弹窗的锁
+  private isProcessingShortcut: boolean = false;
+
+  addController: CustomDialogController | null = null
+  @State floatingButtonScale: number = 1.0;
+
+  async aboutToAppear() {
+    let context = getContext(this) as common.UIAbilityContext;
+    await dbHelper.initDB(context);
+    this.refreshData();
+    // 启动 Motion 监听
+    this.startMotion();
+    // 初始化检查快捷方式 (冷启动)
+    this.onShortcutTrigger();
+  }
+
+  onPageShow() {
+    this.refreshData();
+    // 页面显示检查快捷方式 (热启动/Tab切换)
+    this.onShortcutTrigger();
+  }
+
+  aboutToDisappear() { this.stopMotion(); }
+
+  // 👇👇👇【核心修改】处理快捷方式触发，增加防抖锁 👇👇👇
+  onShortcutTrigger() {
+    // 1. 如果不是本页面的动作，忽略
+    if (this.shortcutAction !== 'action_add_todo') return;
+
+    // 2. 如果正在处理中（锁住状态），忽略 -> 防止二次弹窗
+    if (this.isProcessingShortcut) return;
+
+    console.info('TodoPage 响应快捷方式: 打开新建待办弹窗');
+
+    // 3. 上锁
+    this.isProcessingShortcut = true;
+
+    // 延迟 200ms，等待 Index 页面切换动画完成
+    setTimeout(() => {
+      // 打开弹窗
+      this.openAddTodo();
+
+      // 清空全局动作
+      AppStorage.setOrCreate('GlobalShortcutAction', '');
+
+      // 4. 解锁 (任务完成)
+      this.isProcessingShortcut = false;
+    }, 200);
+  }
+  // 👆👆👆
+
+  // ==========================================
+  // 【核心功能】监听握持姿势 (防抖 + 弹簧动画)
+  // ==========================================
+  startMotion() {
+    try {
+      motion.on('holdingHandChanged', (data: number) => {
+        // data=2 视为右手布局
+        let targetIsRightHand: boolean = (data === 2);
+
+        if (targetIsRightHand !== this.isRightHand) {
+
+          // 如果有正在等待的计时器，清除它（防抖核心）
+          if (this.motionTimerId !== -1) {
+            clearTimeout(this.motionTimerId);
+          }
+
+          // 开启新计时器
+          this.motionTimerId = setTimeout(() => {
+
+            let exitOffsetX = this.isRightHand ? 200 : -200;
+
+            // 1. 滑出阶段 (普通曲线)
+            animateTo({ duration: 250, curve: Curve.EaseIn, onFinish: () => {
+
+              // 切换布局方向
+              this.isRightHand = targetIsRightHand;
+              // 瞬间移动到另一侧屏幕外
+              this.offsetX = targetIsRightHand ? 200 : -200;
+
+              // 2. 滑入阶段 (弹簧曲线)
+              animateTo({
+                curve: curves.springCurve(0, 1, 228, 30)
+              }, () => {
+                this.offsetX = 0;
+                this.opacityValue = 1;
+              });
+
+            } }, () => {
+              this.offsetX = exitOffsetX;
+              this.opacityValue = 0;
+            });
+
+            this.motionTimerId = -1;
+
+          }, this.DEBOUNCE_DELAY);
+
+        } else {
+          // 状态未变，取消可能的计时器
+          if (this.motionTimerId !== -1) {
+            clearTimeout(this.motionTimerId);
+            this.motionTimerId = -1;
+          }
+        }
+      });
+    } catch (err) {
+      console.error('Motion 监听失败: ' + JSON.stringify(err));
+    }
+  }
+
+  stopMotion() {
+    try {
+      motion.off('holdingHandChanged');
+      if (this.motionTimerId !== -1) {
+        clearTimeout(this.motionTimerId);
+      }
+    } catch (err) {}
+  }
+
+  // ==========================================
+  // 数据刷新与通知更新
+  // ==========================================
+  async refreshData() {
+    const start = new Date(this.selectedDate); start.setHours(0,0,0,0);
+    const end = new Date(this.selectedDate); end.setHours(23,59,59,999);
+
+    const allTodos = await dbHelper.getTodosByDate(start.getTime(), end.getTime());
+    this.unfinishedList = allTodos.filter(t => t.isFinished === 0);
+    this.finishedList = allTodos.filter(t => t.isFinished === 1);
+    this.totalCount = allTodos.length;
+    this.finishedCount = this.finishedList.length;
+
+    // 如果是查看“今天”，则更新晚上的进度通知
+    if (this.isToday(this.selectedDate)) {
+      NotificationHelper.updateDailySummary(this.finishedCount, this.totalCount);
+    }
+  }
+
+  // 辅助方法：判断日期是否是今天
+  isToday(date: Date): boolean {
+    const today = new Date();
+    return date.getDate() === today.getDate() &&
+      date.getMonth() === today.getMonth() &&
+      date.getFullYear() === today.getFullYear();
+  }
+
+  openDatePicker() { DatePickerDialog.show({ start: new Date("2020-1-1"), end: new Date("2100-12-31"), selected: this.selectedDate, onAccept: (value: DatePickerResult) => { if (value.year !== undefined && value.month !== undefined && value.day !== undefined) { this.selectedDate = new Date(value.year, value.month, value.day); this.refreshData(); } } }); }
+
+  openAddTodo() {
+    this.addController = new CustomDialogController({
+      builder: AddTodoDialog({
+        confirm: async (content) => {
+          const targetTime = new Date(this.selectedDate);
+          const now = new Date();
+          targetTime.setHours(now.getHours(), now.getMinutes(), now.getSeconds());
+          await dbHelper.addTodo(targetTime.getTime(), content);
+          this.refreshData();
+        }
+      }),
+      alignment: DialogAlignment.Bottom,
+      customStyle: true,
+      autoCancel: true
+    });
+    this.addController.open();
+  }
+
+  async toggleFinish(todo: TodoRecord) { const newStatus = todo.isFinished === 1 ? 0 : 1; await dbHelper.updateTodoStatus(todo.id, newStatus); this.refreshData(); }
+  async handleDelete(id: number) { await dbHelper.deleteTodo(id); this.refreshData(); }
+  getDateTitle(): string { return `${this.selectedDate.getMonth() + 1}月${this.selectedDate.getDate()}日`; }
+
+  getProgressPercent(): number {
+    if (this.totalCount === 0) return 0;
+    return Math.round((this.finishedCount / this.totalCount) * 100);
+  }
+
+  getProgressBgColor(): ResourceColor {
+    return $r('app.color.divider');
+  }
+
+  build() {
+    Column() {
+      // 顶部标题栏
+      Row() {
+        Column() {
+          Row({ space: 4 }) {
+            Text("待办清单").fontSize(24).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
+            Button({ type: ButtonType.Circle }) { SymbolGlyph($r('sys.symbol.calendar')).fontSize(20).fontColor([$r('app.color.accent')]) }
+            .width(32).height(32).backgroundColor($r('app.color.input_bg')).onClick(() => this.openDatePicker())
+          }.alignItems(VerticalAlign.Center)
+
+          Text(this.getDateTitle()).fontSize(14).fontColor($r('app.color.text_secondary')).margin({ top: 4, left: 2 })
+        }.alignItems(HorizontalAlign.Start)
+
+        Blank()
+
+        // 进度环
+        Stack({ alignContent: Alignment.Center }) {
+          Progress({ value: this.finishedCount, total: this.totalCount, type: ProgressType.Ring })
+            .width(50).height(50)
+            .color($r('app.color.accent'))
+            .backgroundColor(this.getProgressBgColor())
+            .style({ strokeWidth: 5 });
+
+          Column({ space: 2 }) {
+            Text(`${this.getProgressPercent()}%`)
+              .fontSize(12).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
+            Text(`${this.finishedCount}/${this.totalCount}`)
+              .fontSize(8).fontColor($r('app.color.text_secondary'))
+          }
+        }
+      }
+      .width('100%').padding({ left: 20, right: 20, top: 56, bottom: 15 }).backgroundColor($r('app.color.page_bg'))
+
+      // 列表区域
+      if (this.totalCount === 0) {
+        Column() {
+          SymbolGlyph($r('sys.symbol.doc_plaintext')).fontSize(50).fontColor([$r('app.color.text_secondary')]);
+          Text('暂无待办，点右下角添加').fontSize(14).fontColor($r('app.color.text_secondary')).margin({ top: 10 })
+        }.width('100%').layoutWeight(1).justifyContent(FlexAlign.Center)
+      } else {
+        List({ space: 10 }) {
+          if (this.unfinishedList.length > 0) {
+            ListItem() {
+              Text('进行中').fontSize(14).fontWeight(FontWeight.Bold).fontColor($r('app.color.accent')).margin({ left: 5, bottom: 5 })
+            }
+            ForEach(this.unfinishedList, (item: TodoRecord) => {
+              TodoItemCard({
+                item: item,
+                onToggle: () => { this.toggleFinish(item) },
+                onDelete: () => { this.handleDelete(item.id) }
+              })
+            }, (item: TodoRecord) => item.id.toString())
+          }
+
+          if (this.finishedList.length > 0) {
+            ListItem() {
+              Text('已完成').fontSize(14).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_secondary')).margin({ left: 5, top: 10, bottom: 5 })
+            }
+            ForEach(this.finishedList, (item: TodoRecord) => {
+              TodoItemCard({
+                item: item,
+                onToggle: () => { this.toggleFinish(item) },
+                onDelete: () => { this.handleDelete(item.id) }
+              })
+            }, (item: TodoRecord) => item.id.toString())
+          }
+
+          ListItem().height(80)
+        }
+        .width('100%').layoutWeight(1).padding({ left: 15, right: 15 }).scrollBar(BarState.Off)
+      }
+
+      // ==========================================
+      // 【悬浮按钮区域】
+      // ==========================================
+      Row() {
+        Button() {
+          Row() {
+            SymbolGlyph($r('sys.symbol.list_checkmask')).fontSize(24).fontColor([Color.White]).margin({ right: 8 });
+            Text('新建待办').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Color.White)
+          }
+        }
+        .height(50).padding({ left: 20, right: 20 }).backgroundColor($r('app.color.accent')).borderRadius(25).shadow({ radius: 10, color: '#40007DFF', offsetY: 5 })
+        .onClick(() => this.openAddTodo())
+        .scale({ x: this.floatingButtonScale, y: this.floatingButtonScale })
+        .onTouch((event: TouchEvent) => {
+          animateTo({ duration: 100, curve: Curve.EaseOut }, () => {
+            if (event.type === TouchType.Down) {
+              this.floatingButtonScale = 0.95;
+            } else if (event.type === TouchType.Up) {
+              this.floatingButtonScale = 1.0;
+            }
+          });
+        })
+      }
+      .width('100%')
+
+      // 位置：80% 高度
+      .position({ x: 0, y: '80%' })
+
+      // 布局对齐：根据握持手动态调整
+      .justifyContent(this.isRightHand ? FlexAlign.End : FlexAlign.Start)
+
+      .padding({ left: 20, right: 20 })
+
+      // 动画位移与透明度
+      .translate({ x: this.offsetX })
+      .opacity(this.opacityValue)
+
+      .hitTestBehavior(HitTestMode.Transparent)
+
+    }.width('100%').height('100%').backgroundColor($r('app.color.page_bg'))
+  }
+}
