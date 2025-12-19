@@ -1,0 +1,1008 @@
+// entry/src/main/ets/pages/CalendarPage.ets
+import { dbHelper, Student, CourseRecord, InspirationRecord, TodoRecord, GroupStat, PeriodStats, CreditStats } from '../db/DBHelper';
+import { common } from '@kit.AbilityKit';
+import { promptAction } from '@kit.ArkUI';
+import { curves } from '@kit.ArkUI';
+
+// =======================
+// 0. 基础类型与组件
+// =======================
+interface StudentGroup {
+  name: string;
+  studentIds: number[];
+}
+
+interface DisplayGroup {
+  type: 'group';
+  date: number;
+  records: CourseRecord[];
+}
+
+interface KnowledgeSummary {
+  type: 'knowledge';
+  date: number;
+  records: InspirationRecord[];
+}
+
+interface KnowledgePointItem {
+  id: number;
+  content: string;
+}
+
+interface KnowledgeByChapter {
+  chapter: string;
+  points: KnowledgePointItem[];
+}
+
+interface ChapterStatGroup {
+  chapterName: string;
+  items: GroupStat[];
+}
+
+type ScheduleItem = DisplayGroup | KnowledgeSummary;
+
+// 【复用】数据卡片组件
+@Component
+struct DataCard {
+  title: string = '';
+  value: string = '';
+  subText: string = '';
+  icon: Resource = $r('sys.symbol.circle');
+  color1: string = '#007DFF';
+  color2: string = '#0055FF';
+
+  build() {
+    Column() {
+      Row() {
+        Text(this.title).fontSize(14).fontColor('rgba(255,255,255,0.9)')
+        Blank()
+        SymbolGlyph(this.icon).fontSize(20).fontColor([Color.White])
+      }.width('100%').margin({ bottom: 10 })
+
+      Text(this.value).fontSize(28).fontWeight(FontWeight.Bold).fontColor(Color.White)
+      Text(this.subText).fontSize(12).fontColor('rgba(255,255,255,0.7)').margin({ top: 4 })
+    }
+    .width('100%')
+    .height(110)
+    .padding(15)
+    .linearGradient({ angle: 135, colors: [[this.color1, 0.0], [this.color2, 1.0]] })
+    .borderRadius(20)
+    .shadow({ radius: 10, color: this.color2 + '40', offsetY: 5 })
+    .alignItems(HorizontalAlign.Start)
+    .stateStyles({
+      pressed: { .scale({ x: 0.96, y: 0.96 }) },
+      normal: { .scale({ x: 1.0, y: 1.0 }) }
+    })
+    .animation({ duration: 200 })
+  }
+}
+
+// =======================
+// 1. 组件：带章节分组的条形图
+// =======================
+@Component
+struct NativeBarChart {
+  @Prop @Watch('redraw') data: ChapterStatGroup[]
+  @Prop totalStudents: number
+  @State renderTrigger: number = 0
+
+  redraw() { this.renderTrigger++; }
+
+  build() {
+    Column() {
+      if (this.data.length === 0) {
+        Column() {
+          Text('暂无知识点数据').fontSize(14).fontColor('#CCC')
+          Text('请在"知识灵感"中添加章节').fontSize(12).fontColor('#EEE').margin({top:4})
+        }.width('100%').height(150).justifyContent(FlexAlign.Center)
+      } else {
+        Row() {
+          Text('章节').fontSize(12).fontColor('#999').width('15%').textAlign(TextAlign.Center)
+          Text('知识点').fontSize(12).fontColor('#999').width('25%').padding({ left: 5 })
+          Text('掌握进度').fontSize(12).fontColor('#999').layoutWeight(1).padding({ left: 10 })
+          Text('人数').fontSize(12).fontColor('#999').width(40).textAlign(TextAlign.End)
+        }.width('100%').margin({ bottom: 15 })
+
+        Column({ space: 0 }) {
+          ForEach(this.data, (group: ChapterStatGroup) => {
+            Row() {
+              // 左侧：章节名称 (竖向排列)
+              Column({ space: 2 }) {
+                ForEach(group.chapterName.split(''), (char: string) => {
+                  Text(char).fontSize(12).fontWeight(FontWeight.Bold).fontColor('#333').textAlign(TextAlign.Center).lineHeight(14)
+                })
+              }
+              .width('15%').padding({ right: 5, top: 10, bottom: 10 }).justifyContent(FlexAlign.Center)
+              .backgroundColor('#FAFAFA').border({ width: { right: 1 }, color: '#EEE' })
+
+              // 右侧：知识点列表
+              Column({ space: 12 }) {
+                ForEach(group.items, (item: GroupStat) => {
+                  Row() {
+                    Text(item.name).fontSize(13).fontColor('#555').width('32%').maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Stack({ alignContent: Alignment.Start }) {
+                      Row().width('100%').height(8).backgroundColor('#F0F2F5').borderRadius(4)
+                      Row().width(`${item.count > 0 ? Math.max((item.count / (this.totalStudents || 1)) * 100, 5) : 0}%`).height(8).backgroundColor(item.count === this.totalStudents && item.count > 0 ? '#00AA00' : '#007DFF').borderRadius(4)
+                    }.layoutWeight(1).padding({ left: 10, right: 10 })
+                    Text(`${item.count}人`).fontSize(12).fontColor(item.count === 0 ? '#CCC' : '#666').width(40).textAlign(TextAlign.End)
+                  }.width('100%').alignItems(VerticalAlign.Center)
+                })
+              }.layoutWeight(1).padding({ left: 10, top: 10, bottom: 10 })
+            }.width('100%').alignItems(VerticalAlign.Center).border({ width: { bottom: 1 }, color: '#F9F9F9' })
+          })
+        }
+      }
+    }.width('100%').padding(20).backgroundColor(Color.White).borderRadius(16).shadow({ radius: 10, color: '#0F000000', offsetY: 2 })
+  }
+}
+
+// =======================
+// 2. 弹窗：学情分析 (CustomDialog)
+// =======================
+@CustomDialog
+struct ReportCenterDialog {
+  controller: CustomDialogController
+  @State weekFinished: number = 0
+  @State monthFinished: number = 0
+  @State studentCount: number = 0
+  @State creditStats: CreditStats = { used: 0, total: 0 }
+  @State groupedStats: ChapterStatGroup[] = []
+
+  async aboutToAppear() {
+    const pStats = await dbHelper.getPeriodStats();
+    this.weekFinished = pStats.week;
+    this.monthFinished = pStats.month;
+    this.creditStats = await dbHelper.getTotalCreditStats();
+    const students = await dbHelper.getStudents();
+    this.studentCount = students.length;
+    await this.processData();
+  }
+
+  async processData() {
+    const start = 0;
+    const end = new Date().getTime() + 31536000000;
+    const allInspirations = await dbHelper.getInspirationsByDate(start, end);
+    const pointToChapterMap = new Map<string, string>();
+    allInspirations.forEach(insp => { if (insp.point && insp.chapter) pointToChapterMap.set(insp.point, insp.chapter); });
+
+    const rawStats = await dbHelper.getKnowledgeStats();
+    const statsMap = new Map<string, number>();
+    rawStats.forEach(s => statsMap.set(s.name, s.count));
+
+    const structureMap = new Map<string, Set<string>>();
+    allInspirations.forEach(insp => {
+      const chapter = insp.chapter || "未分类";
+      const point = insp.point || "未知知识点";
+      if (!structureMap.has(chapter)) structureMap.set(chapter, new Set());
+      structureMap.get(chapter)?.add(point);
+    });
+
+    const result: ChapterStatGroup[] = [];
+    structureMap.forEach((pointSet, chapterName) => {
+      const items: GroupStat[] = [];
+      pointSet.forEach(pointName => {
+        const count = statsMap.get(pointName) || 0;
+        items.push({ name: pointName, count: count, studentNames: [] });
+      });
+      if (items.length > 0) result.push({ chapterName: chapterName, items: items });
+    });
+
+    this.groupedStats = result.sort((a, b) => a.chapterName.localeCompare(b.chapterName));
+  }
+
+  build() {
+    Column() {
+      // 头部
+      Row() {
+        Text('数据统计').fontSize(24).fontWeight(FontWeight.Bold).fontColor('#333')
+        Blank()
+        Button({ type: ButtonType.Circle }) {
+          SymbolGlyph($r('sys.symbol.xmark')).fontSize(22).fontColor(['#999'])
+        }
+        .width(36).height(36).backgroundColor('#F5F5F5')
+        .onClick(() => { this.controller.close() })
+      }.width('100%').margin({ bottom: 20 })
+
+      Scroll() {
+        Column({ space: 15 }) {
+          Column() {
+            Row() {
+              SymbolGlyph($r('sys.symbol.clock')).fontSize(20).fontColor(['#007DFF']).margin({ right: 8 })
+              Text('课时统计').fontSize(16).fontWeight(FontWeight.Bold).fontColor('#333')
+            }.width('100%').margin({ bottom: 10 })
+
+            Grid() {
+              GridItem() { DataCard({ title: '本周消课', value: this.weekFinished.toString(), subText: '节课程', icon: $r('sys.symbol.calendar'), color1: '#007DFF', color2: '#0055FF' }) }
+              GridItem() { DataCard({ title: '本月消课', value: this.monthFinished.toString(), subText: '节课程', icon: $r('sys.symbol.text_aligncenter'), color1: '#FF9900', color2: '#FF7700' }) }
+              GridItem() { DataCard({ title: '总学员', value: this.studentCount.toString(), subText: '人', icon: $r('sys.symbol.person_2_fill'), color1: '#00CC88', color2: '#00AA66' }) }
+              GridItem() { DataCard({ title: '剩余总课时', value: (this.creditStats.total - this.creditStats.used).toString(), subText: '课时', icon: $r('sys.symbol.clock_fill'), color1: '#9900FF', color2: '#7700DD' }) }
+            }
+            .columnsTemplate('1fr 1fr')
+            .columnsGap(10)
+            .rowsGap(10)
+            .height(230)
+          }
+
+          Column() {
+            Row() {
+              SymbolGlyph($r('sys.symbol.star_fill')).fontSize(20).fontColor(['#FFD700']).margin({ right: 8 })
+              Text('知识点掌握分布').fontSize(16).fontWeight(FontWeight.Bold).fontColor('#333')
+            }.width('100%').margin({ bottom: 15 })
+
+            NativeBarChart({ data: this.groupedStats, totalStudents: this.studentCount })
+          }
+          .width('100%')
+        }.width('100%')
+      }
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+    }
+    .width('100%')
+    .height('85%')
+    .padding(20)
+    .backgroundColor('#F5F7FA')
+    .borderRadius({ topLeft: 24, topRight: 24 })
+  }
+}
+
+// =======================
+// 3. 弹窗：今日概览 (CustomDialog)
+// =======================
+@CustomDialog
+struct DailyDetailDialog {
+  controller: CustomDialogController
+  currentDate: Date = new Date()
+  onDataChanged: () => void = () => {}
+  onOpenAnalysis: (group: DisplayGroup) => void = () => {}
+  // 【新增】排课回调
+  onAddCourse: () => void = () => {}
+
+  @State items: ScheduleItem[] = []
+  @State selectedPointId: number = -1
+  rescheduleController: CustomDialogController | null = null
+
+  async aboutToAppear() { await this.refreshLocalData(); }
+
+  async refreshLocalData() {
+    const s = new Date(this.currentDate); s.setHours(0,0,0,0); const e = new Date(this.currentDate); e.setHours(23,59,59,999);
+    const c = await dbHelper.getCoursesByDate(s.getTime(), e.getTime());
+    const i = await dbHelper.getInspirationsByDate(s.getTime(), e.getTime());
+    const map = new Map<number, CourseRecord[]>();
+    c.forEach(r => { if(!map.has(r.date)) map.set(r.date, []); map.get(r.date)?.push(r); });
+    const groups: DisplayGroup[] = [];
+    map.forEach((recs, date) => groups.push({ type: 'group', date: date, records: recs }));
+    const finalItems: ScheduleItem[] = [...groups];
+    if (i.length > 0) {
+      finalItems.push({ type: 'knowledge', date: s.getTime(), records: i } as KnowledgeSummary);
+    }
+    this.items = finalItems.sort((a, b) => a.date - b.date);
+    this.onDataChanged();
+  }
+
+  showActionMenu(r: CourseRecord) {
+    ActionSheet.show({
+      title: `${r.studentName} 的课程操作`,
+      message: '请选择操作类型',
+      autoCancel: true,
+      alignment: DialogAlignment.Bottom,
+      confirm: { value: '取消', action: () => {} },
+      sheets: [
+        { title: '🗓️ 调课', action: () => { this.rescheduleController = new CustomDialogController({ builder: RescheduleDialog({ courseId: r.id, originalDate: r.date, onConfirm: () => { this.refreshLocalData() } }), alignment: DialogAlignment.Bottom }); this.rescheduleController.open(); } },
+        { title: '🏖️ 请假', action: async () => { await dbHelper.markAsLeave(r.id); this.refreshLocalData(); } },
+        { title: '❌ 删除', action: async () => { await dbHelper.deleteCourse(r.id); this.refreshLocalData(); } }
+      ]
+    });
+  }
+
+  async finishGroup(group: DisplayGroup) {
+    for (const r of group.records) { if (r.isFinished === 0 && r.status === 0) await dbHelper.finishCourse(r.id, r.studentId); }
+    this.refreshLocalData();
+  }
+
+  async deleteInsp(id: number) { await dbHelper.deleteInspiration(id); this.refreshLocalData(); }
+
+  getStudentNames(group: DisplayGroup): string { return group.records.map(r => r.studentName).join('、'); }
+  formatTime(ts: number): string { const d = new Date(ts); return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`; }
+  getTitleDate(): string { return `${this.currentDate.getMonth() + 1}月${this.currentDate.getDate()}日`; }
+
+  groupInspirationsByChapter(records: InspirationRecord[]): KnowledgeByChapter[] {
+    const map = new Map<string, KnowledgePointItem[]>();
+    records.forEach(r => {
+      const chapter = r.chapter || '未分类';
+      if (!map.has(chapter)) { map.set(chapter, []); }
+      const pointItem: KnowledgePointItem = { id: r.id, content: r.point };
+      map.get(chapter)?.push(pointItem);
+    });
+    const result: KnowledgeByChapter[] = [];
+    map.forEach((points, chapter) => { result.push({ chapter, points }); });
+    return result;
+  }
+
+  build() {
+    Column() {
+      Row() {
+        Text(this.getTitleDate()).fontSize(24).fontWeight(FontWeight.Bold).margin({ right: 10 })
+        Divider().vertical(true).height(18).color('#CCC').strokeWidth(2).margin({ right: 10 })
+        Text('今日概览').fontSize(16).fontWeight(FontWeight.Bold).fontColor('#333')
+        Blank()
+        // 【新增】排课按钮
+        Button('排课').fontSize(12).height(28).backgroundColor('#33CC88').margin({ right: 10 }).onClick(() => { this.onAddCourse() })
+        Button('收起').fontSize(12).height(28).backgroundColor('#007DFF').onClick(() => { this.controller.close() })
+      }.width('100%').margin({ bottom: 20 })
+
+      if (this.items.length === 0) {
+        Column() { Text('暂无安排').fontColor('#999') }.width('100%').height(100).justifyContent(FlexAlign.Center)
+      } else {
+        List({ space: 15 }) {
+          ForEach(this.items, (item: ScheduleItem) => {
+            ListItem() {
+              if (item.type === 'group') {
+                Row() {
+                  Divider().vertical(true).height(40).color('#007DFF').strokeWidth(4).margin({ right: 10 })
+                  Column() {
+                    Text('课程').fontSize(14).fontColor('#333').fontWeight(FontWeight.Bold)
+                    Text(this.formatTime(item.date)).fontSize(12).fontColor('#999').margin({top:4})
+                  }.alignItems(HorizontalAlign.Start).width(60)
+                  Text(this.getStudentNames(item as DisplayGroup))
+                    .fontSize(14).fontWeight(FontWeight.Medium).layoutWeight(1).textAlign(TextAlign.Center).maxLines(1).textOverflow({overflow: TextOverflow.Ellipsis})
+                    .onClick(() => { this.showActionMenu((item as DisplayGroup).records[0]) })
+                  Row({ space: 8 }) {
+                    Button('分析').fontSize(10).height(24).backgroundColor('#E6F2FF').fontColor('#007DFF').padding({ left: 8, right: 8 }).onClick(() => {
+                      this.onOpenAnalysis(item as DisplayGroup);
+                      this.controller.close(); // 关闭Dialog
+                    })
+                    if ((item as DisplayGroup).records.some(r => r.isFinished === 0 && r.status === 0)) {
+                      Button('消课').fontSize(10).height(24).backgroundColor('#007DFF').padding({ left: 8, right: 8 }).onClick(() => { this.finishGroup(item as DisplayGroup) })
+                    } else {
+                      Text('已消课').fontSize(10).fontColor('#999').backgroundColor('#F5F5F5').padding(4).borderRadius(4)
+                    }
+                  }.margin({ left: 5 })
+                }.padding({ left: 10, right: 10, top: 12, bottom: 12 }).backgroundColor('#F9F9F9').borderRadius(12).margin({ left: 5, right: 5 })
+              } else {
+                Column() {
+                  Row() { SymbolGlyph($r('sys.symbol.lightbulb')).fontSize(20).fontColor(['#FF9900']).margin({right:8}); Text('今日知识点').fontSize(16).fontWeight(FontWeight.Bold).fontColor('#333') }.width('100%').margin({bottom:5})
+                  List({ space: 0 }) {
+                    ForEach(this.groupInspirationsByChapter((item as KnowledgeSummary).records), (group: KnowledgeByChapter) => {
+                      ListItem() {
+                        Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
+                          Text(group.chapter + "：").fontSize(14).fontColor('#333').fontWeight(FontWeight.Bold).margin({ right: 5 })
+                          ForEach(group.points, (pt: KnowledgePointItem) => {
+                            Stack({ alignContent: Alignment.TopEnd }) {
+                              Text(pt.content).fontSize(12).fontColor('#007DFF').padding({ left: 12, right: 12, top: 6, bottom: 6 }).backgroundColor('#E6F2FF').borderRadius(6).margin({ top: 6, right: 6 }).onClick(() => { this.selectedPointId = (this.selectedPointId === pt.id) ? -1 : pt.id; })
+                              if (this.selectedPointId === pt.id) { Button({ type: ButtonType.Circle }) { SymbolGlyph($r('sys.symbol.xmark')).fontSize(10).fontWeight(FontWeight.Bold).fontColor([Color.White]) }.width(18).height(18).backgroundColor('#FF4040').onClick(() => { this.deleteInsp(pt.id); this.selectedPointId = -1; }).shadow({ radius: 3, color: '#33000000', offsetY: 1 }) }
+                            }.margin({ right: 8, bottom: 0 })
+                          })
+                        }.width('100%')
+                      }
+                    })
+                  }
+                }.width('100%').padding(15).backgroundColor(Color.White).borderRadius(12).shadow({ radius: 5, color: '#10000000', offsetY: 2 }).margin({ left: 5, right: 5 })
+              }
+            }
+          })
+        }.width('100%').height(400).scrollBar(BarState.Off)
+      }
+    }
+    .width('100%')
+    .padding(20).backgroundColor('#F5F7FA').borderRadius({ topLeft: 24, topRight: 24 })
+  }
+}
+
+// =======================
+// 4. 半模态：课后分析 (PostClassAnalysisSheet)
+// =======================
+@Component
+struct PostClassAnalysisSheet {
+  @Prop courseDate: number
+  @Prop records: CourseRecord[]
+  onClose: () => void = () => {}
+
+  @State knowledgePoints: string[] = []
+  @State students: Student[] = []
+  @State masteryMatrix: boolean[][] = []
+
+  async aboutToAppear() {
+    const start = new Date(this.courseDate); start.setHours(0,0,0,0);
+    const end = new Date(this.courseDate); end.setHours(23,59,59,999);
+    const inspirations = await dbHelper.getInspirationsByDate(start.getTime(), end.getTime());
+
+    const pointsSet = new Set<string>();
+    inspirations.forEach(ins => { if (ins.point) pointsSet.add(ins.point); });
+    this.knowledgePoints = Array.from(pointsSet);
+
+    if (this.records.length > 0) {
+      const allStudents = await dbHelper.getStudents();
+      const targetIds = this.records.map(r => r.studentId);
+      this.students = allStudents.filter(s => targetIds.includes(s.id));
+    }
+
+    if (this.students.length > 0 && this.knowledgePoints.length > 0) {
+      const matrix: boolean[][] = [];
+      for (let i = 0; i < this.students.length; i++) {
+        const row: boolean[] = [];
+        const masteredPoints = await dbHelper.getStudentMastery(this.students[i].id, start.getTime());
+        for (let j = 0; j < this.knowledgePoints.length; j++) {
+          row.push(masteredPoints.includes(this.knowledgePoints[j]));
+        }
+        matrix.push(row);
+      }
+      this.masteryMatrix = matrix;
+    }
+  }
+
+  async toggleMastery(stuIdx: number, pointIdx: number) {
+    const newRow = [...this.masteryMatrix[stuIdx]];
+    newRow[pointIdx] = !newRow[pointIdx];
+    this.masteryMatrix[stuIdx] = newRow;
+    this.masteryMatrix = [...this.masteryMatrix];
+
+    const start = new Date(this.courseDate); start.setHours(0,0,0,0);
+    await dbHelper.updateMastery(this.students[stuIdx].id, start.getTime(), this.knowledgePoints[pointIdx], newRow[pointIdx]);
+  }
+
+  build() {
+    Column() {
+      // 拖拽条
+      Row().width(40).height(5).backgroundColor('#E0E0E0').borderRadius(2.5).margin({ top: 10, bottom: 20 })
+
+      // 标题 (移除 X)
+      Row() {
+        Column() {
+          Text('课后分析').fontSize(22).fontWeight(FontWeight.Bold).fontColor('#333')
+          Text('标记学员今日掌握的知识点').fontSize(12).fontColor('#999').margin({ top: 4 })
+        }.alignItems(HorizontalAlign.Start)
+        Blank()
+        // 只保留完成
+        Button('完成')
+          .height(32).fontSize(14).backgroundColor('#007DFF')
+          .onClick(() => { this.onClose() })
+      }.width('100%').margin({ bottom: 20 })
+
+      if (this.knowledgePoints.length === 0) {
+        Column() {
+          SymbolGlyph($r('sys.symbol.questionmark_circle')).fontSize(40).fontColor(['#DDDDDD']).margin({ bottom: 10 })
+          Text('今日未添加知识灵感').fontColor('#999').fontSize(14)
+          Text('请先点击首页“知识灵感”添加知识点').fontColor('#CCC').fontSize(12).margin({ top: 5 })
+        }.height(200).justifyContent(FlexAlign.Center).width('100%')
+      } else {
+        List() {
+          ForEach(this.students, (stu: Student, i: number) => {
+            ListItem() {
+              Column() {
+                Row() {
+                  Text(stu.name.substring(0, 1))
+                    .fontSize(14).fontWeight(FontWeight.Bold).fontColor(Color.White)
+                    .width(28).height(28).textAlign(TextAlign.Center)
+                    .backgroundColor('#007DFF').borderRadius(14).margin({ right: 10 })
+                  Text(stu.name).fontSize(16).fontWeight(FontWeight.Bold).fontColor('#333')
+                }.width('100%').margin({ bottom: 12 })
+
+                Divider().color('#F5F5F5').margin({ bottom: 12 })
+
+                Flex({ wrap: FlexWrap.Wrap }) {
+                  ForEach(this.knowledgePoints, (p: string, j: number) => {
+                    Row() {
+                      if (this.masteryMatrix[i] && this.masteryMatrix[i][j]) {
+                        SymbolGlyph($r('sys.symbol.checkmark')).fontSize(12).fontColor([Color.White]).margin({ right: 4 })
+                      }
+                      Text(p).fontSize(12).fontColor((this.masteryMatrix[i] && this.masteryMatrix[i][j]) ? Color.White : '#666')
+                    }
+                    .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                    .backgroundColor((this.masteryMatrix[i] && this.masteryMatrix[i][j]) ? '#007DFF' : '#F5F5F5')
+                    .borderRadius(16)
+                    .margin({ right: 8, bottom: 8 })
+                    .animation({ duration: 200 })
+                    .onClick(() => { this.toggleMastery(i, j) })
+                  })
+                }
+              }
+              .width('100%').padding(15).backgroundColor(Color.White).borderRadius(16).shadow({ radius: 8, color: '#0A000000', offsetY: 2 }).margin({ bottom: 15 })
+            }
+          })
+        }
+        .width('100%').layoutWeight(1).scrollBar(BarState.Off).edgeEffect(EdgeEffect.Spring)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 20, right: 20, bottom: 20 })
+    .backgroundColor('#F5F7FA') // 统一背景色
+  }
+}
+
+// =======================
+// 5. 弹窗：知识灵感
+// =======================
+@CustomDialog
+struct AddKnowledgeDialog {
+  controller: CustomDialogController
+  confirm: (chapter: string, points: string[]) => void = () => {}
+  @State chapter: string = ''
+  @State point1: string = ''
+  @State point2: string = ''
+  @State point3: string = ''
+  @State point4: string = ''
+
+  build() {
+    Column({ space: 15 }) {
+      Text('今日知识灵感').fontSize(20).fontWeight(FontWeight.Bold).width('100%')
+      TextInput({ placeholder: '知识章节 (如: 第一章 基础乐理)', text: this.chapter }).onChange(v => this.chapter = v).backgroundColor('#F5F5F5').height(45).borderRadius(8)
+      Text('知识点 (最多4个)').fontSize(14).fontColor('#999').width('100%').margin({top:5})
+      TextInput({ placeholder: '知识点 1', text: this.point1 }).onChange(v => this.point1 = v).backgroundColor('#F5F5F5').height(40).borderRadius(8)
+      TextInput({ placeholder: '知识点 2', text: this.point2 }).onChange(v => this.point2 = v).backgroundColor('#F5F5F5').height(40).borderRadius(8)
+      TextInput({ placeholder: '知识点 3', text: this.point3 }).onChange(v => this.point3 = v).backgroundColor('#F5F5F5').height(40).borderRadius(8)
+      TextInput({ placeholder: '知识点 4', text: this.point4 }).onChange(v => this.point4 = v).backgroundColor('#F5F5F5').height(40).borderRadius(8)
+      Row({ space: 15 }) {
+        Button('取消').layoutWeight(1).backgroundColor('#EEE').fontColor('#666').onClick(() => { this.controller.close() })
+        Button('保存').layoutWeight(1).backgroundColor('#FF9900').onClick(() => {
+          const points = [this.point1, this.point2, this.point3, this.point4].filter(p => p.trim() !== '');
+          if (this.chapter && points.length > 0) { this.confirm(this.chapter, points); this.controller.close(); }
+          else { promptAction.showToast({ message: '请填写章节并至少输入一个知识点' }); }
+        })
+      }.width('100%').margin({ top: 10 })
+    }.padding(20).backgroundColor(Color.White).borderRadius(16)
+  }
+}
+
+// =======================
+// 6. 弹窗：调课
+// =======================
+@CustomDialog
+struct RescheduleDialog {
+  controller: CustomDialogController
+  courseId: number = 0
+  originalDate: number = 0
+  onConfirm: () => void = () => {}
+  @State selectedDate: Date = new Date()
+  aboutToAppear() { this.selectedDate = new Date(this.originalDate); }
+  build() {
+    Column() {
+      Text('课程调整').fontSize(18).fontWeight(FontWeight.Bold).margin({ bottom: 20 })
+      DatePicker({ start: new Date(), end: new Date('2030-12-31'), selected: this.selectedDate }).onChange((v) => { if(v.year&&v.month&&v.day) this.selectedDate.setFullYear(v.year,v.month,v.day) })
+      TimePicker({ selected: this.selectedDate }).onChange((v) => { if(v.hour!==undefined&&v.minute!==undefined) this.selectedDate.setHours(v.hour,v.minute) })
+      Row({ space: 20 }) {
+        Button('取消').layoutWeight(1).backgroundColor('#F5F5F5').fontColor('#666').onClick(() => { this.controller.close() })
+        Button('确认').layoutWeight(1).backgroundColor('#007DFF').onClick(async () => { await dbHelper.rescheduleCourse(this.courseId, this.selectedDate.getTime()); this.onConfirm(); this.controller.close(); })
+      }.width('100%').margin({ top: 20 })
+    }.padding(20).backgroundColor(Color.White).borderRadius(20)
+  }
+}
+
+// =======================
+// 7. 弹窗：排课
+// =======================
+@CustomDialog
+struct AddCourseDialog {
+  controller: CustomDialogController
+  students: Student[] = []
+  groups: StudentGroup[] = []
+  confirm: (studentIds: number[], hour: number, minute: number, note: string, groupName?: string) => void = () => {}
+  @State selectedStudentIds: number[] = []
+  @State note: string = ''
+  @State hours: string[] = []
+  @State minutes: string[] = []
+  @State selectedHour: string = '10'
+  @State selectedMinute: string = '00'
+  @State currentGroupName: string = ''
+
+  aboutToAppear() { for (let i = 0; i < 24; i++) this.hours.push(i.toString().padStart(2, '0')); for (let i = 0; i < 60; i++) this.minutes.push(i.toString().padStart(2, '0')); }
+  toggleStudent(id: number) { if (this.selectedStudentIds.includes(id)) this.selectedStudentIds = this.selectedStudentIds.filter(s => s !== id); else this.selectedStudentIds.push(id); this.checkGroupMatch(); }
+  toggleGroup(group: StudentGroup) { if (this.currentGroupName === group.name) { this.selectedStudentIds = []; this.currentGroupName = ''; } else { this.selectedStudentIds = [...group.studentIds]; this.currentGroupName = group.name; } }
+  checkGroupMatch() { this.currentGroupName = ''; const m = this.groups.find(g => g.studentIds.length === this.selectedStudentIds.length && g.studentIds.every(id => this.selectedStudentIds.includes(id))); if (m) this.currentGroupName = m.name; }
+  getGridHeight(): number { return this.students.length <= 6 ? 100 : 180; }
+
+  build() {
+    Column({ space: 15 }) {
+      Text('安排课程').fontSize(20).fontWeight(FontWeight.Bold).margin({ top: 5 })
+      if (this.groups.length > 0) {
+        Column({ space: 8 }) {
+          Text('快捷分组').fontSize(14).fontColor('#999').width('100%')
+          List({ space: 10 }) { ForEach(this.groups, (g: StudentGroup) => { ListItem() { Text(g.name).fontSize(14).fontColor(this.currentGroupName === g.name ? Color.White : '#007DFF').padding({ left: 12, right: 12, top: 6, bottom: 6 }).backgroundColor(this.currentGroupName === g.name ? '#007DFF' : '#E6F2FF').borderRadius(16).onClick(() => { this.toggleGroup(g) }) } }) }.listDirection(Axis.Horizontal).width('100%').height(36).scrollBar(BarState.Off)
+        }.width('100%')
+      }
+      Grid() { ForEach(this.students, (s: Student) => { GridItem() { Text(s.name).fontSize(14).fontColor(this.selectedStudentIds.includes(s.id) ? Color.White : '#333').fontWeight(this.selectedStudentIds.includes(s.id) ? FontWeight.Bold : FontWeight.Normal).textAlign(TextAlign.Center).width('100%').padding({ top: 6, bottom: 6 }).backgroundColor(this.selectedStudentIds.includes(s.id) ? '#007DFF' : '#F5F5F5').borderRadius(8).onClick(() => { this.toggleStudent(s.id) }) } }) }.columnsTemplate('1fr 1fr 1fr').columnsGap(8).rowsGap(8).height(this.getGridHeight())
+      Column({ space: 5 }) {
+        Text('上课时间').fontSize(14).fontColor('#666').width('100%')
+        Row() {
+          TextPicker({ range: this.hours, selected: parseInt(this.selectedHour) }).onChange((v:string|string[]) => this.selectedHour = v as string).layoutWeight(1).height(55)
+          Text(':').fontSize(20).fontWeight(FontWeight.Bold).margin({ left: 10, right: 10 }).padding({ bottom: 4 })
+          TextPicker({ range: this.minutes, selected: parseInt(this.selectedMinute) }).onChange((v:string|string[]) => this.selectedMinute = v as string).layoutWeight(1).height(55)
+        }.width('100%')
+      }.width('100%')
+      TextInput({ placeholder: '课程备注 (选填)', text: this.note }).onChange(v => this.note = v).backgroundColor('#F5F5F5').fontSize(14).height(45).borderRadius(8)
+      Row({ space: 20 }) {
+        Button('取消').layoutWeight(1).backgroundColor('#F5F5F5').fontColor('#666').onClick(() => { this.controller.close() })
+        Button(`确定 (${this.selectedStudentIds.length})`).layoutWeight(1).backgroundColor('#007DFF').onClick(() => {
+          // 【核心优化】直接调用，不走 AppStorage + setTimeout，消除延迟
+          this.confirm(this.selectedStudentIds, parseInt(this.selectedHour), parseInt(this.selectedMinute), this.note, this.currentGroupName);
+        })
+      }.width('100%')
+    }.padding(25).backgroundColor(Color.White).width('100%').borderRadius({ topLeft: 24, topRight: 24, bottomLeft: 0, bottomRight: 0 })
+  }
+}
+
+// =======================
+// 8. Dialog: Add Todo
+// =======================
+@CustomDialog
+struct AddTodoDialog {
+  controller: CustomDialogController
+  confirm: (content: string) => void = () => {}
+  @State content: string = ''
+  build() {
+    Column({ space: 20 }) {
+      Text('新建待办').fontSize(20).fontWeight(FontWeight.Bold).margin({ top: 10 })
+      TextInput({ placeholder: '内容', text: this.content }).onChange(v => this.content = v).backgroundColor('#F5F5F5').height(50).borderRadius(8)
+      Row({ space: 20 }) {
+        Button('取消').layoutWeight(1).backgroundColor('#F5F5F5').fontColor('#666').onClick(() => { this.controller.close() })
+        Button('保存').layoutWeight(1).backgroundColor('#007DFF').onClick(() => { if (this.content) this.confirm(this.content); })
+      }.width('100%')
+    }.padding(25).backgroundColor(Color.White).borderRadius(16)
+  }
+}
+
+// =======================
+// 9. Dialog: Todo Detail
+// =======================
+@CustomDialog
+struct TodoDetailDialog {
+  controller: CustomDialogController
+  currentDate: Date = new Date()
+  onDataChanged: () => void = () => {}
+  @State todos: TodoRecord[] = []
+  addTodoCtrl: CustomDialogController | null = null
+  async aboutToAppear() { await this.refreshLocalData(); }
+  async refreshLocalData() {
+    const s = new Date(this.currentDate); s.setHours(0,0,0,0); const e = new Date(this.currentDate); e.setHours(23,59,59,999);
+    this.todos = await dbHelper.getTodosByDate(s.getTime(), e.getTime());
+    this.todos.sort((a, b) => a.isFinished - b.isFinished);
+    this.onDataChanged();
+  }
+  openAddTodo() {
+    this.addTodoCtrl = new CustomDialogController({ builder: AddTodoDialog({ confirm: async (c) => { await dbHelper.addTodo(this.currentDate.getTime(), c); this.refreshLocalData(); if(this.addTodoCtrl) this.addTodoCtrl.close(); } }), alignment: DialogAlignment.Bottom });
+    this.addTodoCtrl.open();
+  }
+  async toggleFinish(t: TodoRecord) { await dbHelper.updateTodoStatus(t.id, t.isFinished === 1 ? 0 : 1); this.refreshLocalData(); }
+  async handleDelete(id: number) { await dbHelper.deleteTodo(id); this.refreshLocalData(); }
+
+  @Builder SwipeMenu(id: number) {
+    Row() {
+      Button({ type: ButtonType.Circle }) { SymbolGlyph($r('sys.symbol.trash')).fontSize(24).fontColor([Color.White]) }.width(40).height(40).backgroundColor(Color.Red).onClick(() => { this.handleDelete(id) })
+    }.width(60).justifyContent(FlexAlign.Center)
+  }
+
+  build() {
+    Column() {
+      Row() { Text('待办事项').fontSize(24).fontWeight(FontWeight.Bold); Blank(); Button('新建').height(36).backgroundColor('#007DFF').onClick(() => { this.openAddTodo() }) }.width('100%').margin({ bottom: 20 })
+      if (this.todos.length === 0) {
+        Column() { Text('今天没有待办任务').fontColor('#999') }.width('100%').height(200).justifyContent(FlexAlign.Center)
+      } else {
+        List({ space: 10 }) { ForEach(this.todos, (t: TodoRecord) => { ListItem() { Row() { Stack() { Circle({ width: 24, height: 24 }).fill(t.isFinished ? '#007DFF' : 'transparent').stroke('#007DFF').strokeWidth(2); if (t.isFinished) SymbolGlyph($r('sys.symbol.checkmark')).fontSize(14).fontColor([Color.White]) }.onClick(() => { this.toggleFinish(t) }).margin({ right: 15 }); Text(t.content).fontSize(16).fontColor(t.isFinished ? '#999' : '#333').decoration({ type: t.isFinished ? TextDecorationType.LineThrough : TextDecorationType.None }).layoutWeight(1) }.width('100%').padding(15).backgroundColor('#F5F5F5').borderRadius(12) }.swipeAction({ end: () => { this.SwipeMenu(t.id) } }) }) }.width('100%').height(300)
+      }
+    }.padding(20).backgroundColor(Color.White).borderRadius({ topLeft: 20, topRight: 20 })
+  }
+}
+
+// =======================
+// 10. 主页面 (CalendarPage) - 控制所有 Sheet/Dialog
+// =======================
+@Component
+export struct CalendarPage {
+  @State currentYear: number = new Date().getFullYear();
+  @State currentMonth: number = new Date().getMonth() + 1;
+  @State selectedDay: number = new Date().getDate();
+  @State daysInMonth: number[] = [];
+  @State startWeekDay: number = 0;
+  @State courseMarkers: number[] = [];
+  @State inspMarkers: number[] = [];
+  @State todayCoursesCount: number = 0;
+  @State todayTodosCount: number = 0;
+  @State gridHeight: number = 300;
+
+  // 【Sheet 状态控制】(仅保留课后分析)
+  @State isShowAnalysisSheet: boolean = false;
+  @State currentAnalysisRecords: CourseRecord[] = [];
+  @State currentAnalysisDate: number = 0;
+
+  @StorageProp('AppGlobalUpdate') @Watch('refreshData') updateSignal: number = 0;
+  @StorageLink('GlobalShortcutAction') @Watch('onShortcutTrigger') shortcutAction: string = '';
+
+  // 恢复 Dialog Controller
+  todoController: CustomDialogController | null = null;
+  knowledgeController: CustomDialogController | null = null;
+  directAddCourseController: CustomDialogController | null = null;
+  reportController: CustomDialogController | null = null;
+  detailController: CustomDialogController | null = null;
+
+  async aboutToAppear() {
+    let context = getContext(this) as common.UIAbilityContext;
+    await dbHelper.initDB(context);
+    this.initCalendar();
+    this.refreshData();
+    this.onShortcutTrigger();
+  }
+
+  onPageShow() { this.refreshData(); this.onShortcutTrigger(); }
+
+  // 【优化】直接调用，无延迟。
+  // 【新增参数】支持传入指定日期 targetDate，若不传则默认为当前时间
+  async showAddCourseDialog(targetDate?: Date) {
+    const students = await dbHelper.getStudents();
+    const groups: StudentGroup[] = [];
+    const map = new Map<string, number[]>();
+    students.forEach(s => { const g = s.groupName || '默认'; if (!map.has(g)) map.set(g, []); map.get(g)?.push(s.id); });
+    if (students.length > 1) groups.push({ name: '全员', studentIds: students.map(s => s.id) });
+    map.forEach((ids, name) => { if (ids.length > 0) groups.push({ name: name, studentIds: ids }); });
+
+    this.directAddCourseController = new CustomDialogController({
+      builder: AddCourseDialog({
+        students: students, groups: groups,
+        confirm: async (sids, h, m, note) => {
+          // 【核心逻辑修改】如果有指定日期则使用指定日期，否则使用当前时间
+          const d = targetDate ? new Date(targetDate) : new Date();
+          d.setHours(h, m, 0, 0);
+          for(const sid of sids) await dbHelper.addCourse(sid, d.getTime(), note);
+          this.refreshData();
+          if(this.directAddCourseController) this.directAddCourseController.close();
+        }
+      }), alignment: DialogAlignment.Bottom, customStyle: true
+    });
+    this.directAddCourseController.open();
+  }
+
+  async onShortcutTrigger() {
+    if (!this.shortcutAction) return;
+    if (this.shortcutAction === 'action_add_course') {
+      // 外部快捷方式调用时，可能仍需要一点延时以保证页面切换完成，但内部点击不需要
+      setTimeout(() => {
+        this.showAddCourseDialog();
+        AppStorage.setOrCreate('GlobalShortcutAction', '');
+      }, 200);
+    }
+  }
+
+  // 【关键优化】直接调用方法，无 setTimeout
+  openAddCourse() {
+    this.showAddCourseDialog();
+  }
+
+  openReportCenter() {
+    // 【恢复】使用 Dialog 模式
+    this.reportController = new CustomDialogController({
+      builder: ReportCenterDialog(),
+      alignment: DialogAlignment.Bottom,
+      customStyle: true
+    });
+    this.reportController.open();
+  }
+
+  openAddKnowledge() {
+    this.knowledgeController = new CustomDialogController({
+      builder: AddKnowledgeDialog({
+        confirm: async (c, points) => {
+          const d = new Date(this.currentYear, this.currentMonth-1, this.selectedDay);
+          if(new Date().getDate() === this.selectedDay) d.setTime(new Date().getTime());
+          for(const p of points) { await dbHelper.addKnowledgeInspiration(d.getTime(), c, p); }
+          this.refreshData();
+        }
+      }), alignment: DialogAlignment.Bottom
+    });
+    this.knowledgeController.open();
+  }
+
+  initCalendar() {
+    const d = new Date(this.currentYear, this.currentMonth - 1, 1);
+    this.startWeekDay = d.getDay();
+    const lastDay = new Date(this.currentYear, this.currentMonth, 0).getDate();
+    const totalSlots = this.startWeekDay + lastDay;
+    const rows = Math.ceil(totalSlots / 7);
+    this.gridHeight = rows * 60;
+    const arr: number[] = [];
+    for(let i=1; i<=lastDay; i++) arr.push(i);
+    this.daysInMonth = arr;
+  }
+
+  async refreshData() {
+    const m = await dbHelper.getMonthMarkers(this.currentYear, this.currentMonth);
+    this.courseMarkers = m.courses;
+    this.inspMarkers = m.inspirations;
+
+    const s = new Date(this.currentYear, this.currentMonth - 1, this.selectedDay);
+    const c = await dbHelper.getCoursesByDate(s.getTime(), s.getTime() + 86399999);
+    this.todayCoursesCount = c.length;
+
+    const tStart = new Date(this.selectedDay); tStart.setHours(0,0,0,0);
+    const tEnd = new Date(this.selectedDay); tEnd.setHours(23,59,59,999);
+    const todos = await dbHelper.getTodosByDate(tStart.getTime(), tEnd.getTime());
+    this.todayTodosCount = todos.filter(t => t.isFinished === 0).length;
+  }
+
+  handlePrevMonth() {
+    let y = this.currentYear, m = this.currentMonth - 1;
+    if (m < 1) { y--; m = 12; }
+    this.currentYear = y; this.currentMonth = m;
+    this.initCalendar(); this.refreshData();
+  }
+
+  handleNextMonth() {
+    let y = this.currentYear, m = this.currentMonth + 1;
+    if (m > 12) { y++; m = 1; }
+    this.currentYear = y; this.currentMonth = m;
+    this.initCalendar(); this.refreshData();
+  }
+
+  onDayClick(d: number) {
+    this.selectedDay = d;
+    this.refreshData().then(() => {
+      // 【恢复】使用 Dialog 模式，并传入回调打开 Sheet
+      this.detailController = new CustomDialogController({
+        builder: DailyDetailDialog({
+          currentDate: new Date(this.currentYear, this.currentMonth - 1, this.selectedDay),
+          onDataChanged: () => { this.refreshData(); },
+          onOpenAnalysis: (group) => {
+            const targetDate = new Date(this.currentYear, this.currentMonth - 1, this.selectedDay);
+            this.currentAnalysisDate = targetDate.getTime();
+            this.currentAnalysisRecords = group.records;
+            this.isShowAnalysisSheet = true; // 触发 Sheet
+          },
+          // 【新增】排课按钮回调实现
+          onAddCourse: () => {
+            // 1. 关闭当前的概览弹窗 (避免弹窗层叠，体验更好)
+            if (this.detailController) {
+              this.detailController.close();
+            }
+            // 2. 打开排课弹窗，并传入选中的日期
+            const targetDate = new Date(this.currentYear, this.currentMonth - 1, this.selectedDay);
+            this.showAddCourseDialog(targetDate);
+          }
+        }), alignment: DialogAlignment.Bottom, customStyle: true
+      });
+      this.detailController.open();
+    });
+  }
+
+  openTodoDialog() {
+    this.todoController = new CustomDialogController({
+      builder: TodoDetailDialog({
+        currentDate: new Date(this.currentYear, this.currentMonth - 1, this.selectedDay),
+        onDataChanged: () => { this.refreshData(); }
+      }), alignment: DialogAlignment.Bottom, customStyle: true
+    });
+    this.todoController.open();
+  }
+
+  @Builder OverviewCard() {
+    Row() {
+      Column() {
+        Text('今日概览').fontSize(18).fontWeight(FontWeight.Bold).fontColor('#007DFF')
+        Text(`${this.todayCoursesCount} 项日程`).fontSize(14).fontColor('#666').margin({ top: 5 })
+      }.alignItems(HorizontalAlign.Start)
+      Blank()
+      Stack() {
+        Circle({ width: 50, height: 50 }).fill('rgba(255,255,255,0.2)')
+        SymbolGlyph($r('sys.symbol.calendar')).fontSize(28).fontColor(['#007DFF'])
+      }
+    }
+    .width('100%').padding(20).backgroundColor(Color.White).borderRadius(20)
+    .shadow({ radius: 10, color: '#0A000000', offsetY: 5 })
+    .onClick(() => {
+      const t = new Date();
+      this.selectedDay = t.getDate();
+      this.onDayClick(t.getDate());
+    })
+    .animation({ duration: 200, curve: Curve.FastOutSlowIn })
+    .stateStyles({ pressed: { .scale({ x: 0.98, y: 0.98 }) }, normal: { .scale({ x: 1.0, y: 1.0 }) } })
+  }
+
+  @Builder TodoCard() {
+    Row() {
+      Column() {
+        Text('今日待办').fontSize(18).fontWeight(FontWeight.Bold).fontColor('#007DFF')
+        Text(`${this.todayTodosCount} 个未完成`).fontSize(14).fontColor('#666').margin({ top: 5 })
+      }.alignItems(HorizontalAlign.Start)
+      Blank()
+      SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(32).fontColor(['#007DFF'])
+    }
+    .width('100%').padding(20).backgroundColor(Color.White).borderRadius(20)
+    .shadow({ radius: 10, color: '#0A000000', offsetY: 5 })
+    .onClick(() => { this.openTodoDialog() })
+    .animation({ duration: 200, curve: Curve.FastOutSlowIn })
+    .stateStyles({ pressed: { .scale({ x: 0.98, y: 0.98 }) }, normal: { .scale({ x: 1.0, y: 1.0 }) } })
+  }
+
+  @Builder ActionButtons() {
+    Row({ space: 15 }) {
+      Button() {
+        Column() {
+          SymbolGlyph($r('sys.symbol.calendar_badge_plus')).fontSize(24).fontColor(['#007DFF'])
+          Text('排一节课').fontSize(12).fontColor('#007DFF').margin({top:4}).fontWeight(FontWeight.Bold)
+        }
+      }.layoutWeight(1).height(60).backgroundColor(Color.White).borderRadius(12).onClick(() => { this.openAddCourse() })
+      .stateStyles({ pressed: { .scale({ x: 0.95, y: 0.95 }) }, normal: { .scale({ x: 1.0, y: 1.0 }) } })
+
+      Button() {
+        Column() {
+          SymbolGlyph($r('sys.symbol.lightbulb')).fontSize(24).fontColor(['#FF9900'])
+          Text('知识灵感').fontSize(12).fontColor('#FF9900').margin({top:4}).fontWeight(FontWeight.Bold)
+        }
+      }.layoutWeight(1).height(60).backgroundColor(Color.White).borderRadius(12).onClick(() => { this.openAddKnowledge() })
+      .stateStyles({ pressed: { .scale({ x: 0.95, y: 0.95 }) }, normal: { .scale({ x: 1.0, y: 1.0 }) } })
+
+      Button() {
+        Column() {
+          SymbolGlyph($r('sys.symbol.doc_plaintext')).fontSize(24).fontColor(['#9900FF'])
+          Text('学情分析').fontSize(12).fontColor('#9900FF').margin({top:4}).fontWeight(FontWeight.Bold)
+        }
+      }.layoutWeight(1).height(60).backgroundColor(Color.White).borderRadius(12).onClick(() => { this.openReportCenter() })
+      .stateStyles({ pressed: { .scale({ x: 0.95, y: 0.95 }) }, normal: { .scale({ x: 1.0, y: 1.0 }) } })
+    }.width('100%').margin({ bottom: 0 })
+  }
+
+  // 【新增】Analysis Sheet Builder
+  @Builder AnalysisSheetBuilder() {
+    PostClassAnalysisSheet({
+      courseDate: this.currentAnalysisDate,
+      records: this.currentAnalysisRecords,
+      onClose: () => {
+        this.isShowAnalysisSheet = false;
+      }
+    })
+  }
+
+  build() {
+    Column() {
+      Text("课时记")
+        .fontSize(24)
+        .fontWeight(FontWeight.Bold)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .padding({ top: 50, bottom: 0 })
+        .backgroundColor('#F2F3F5')
+
+      Scroll() {
+        Column({ space: 12 }) {
+          Column() {
+            Row() {
+              SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(20).onClick(() => { this.handlePrevMonth() }).padding(10)
+              Text(`${this.currentYear}年 ${this.currentMonth}月`).fontSize(18).fontWeight(FontWeight.Bold)
+              SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(20).onClick(() => { this.handleNextMonth() }).padding(10)
+            }.width('100%').justifyContent(FlexAlign.Center)
+
+            Grid() {
+              ForEach(Array(this.startWeekDay).fill(0), () => { GridItem() })
+              ForEach(this.daysInMonth, (d: number) => {
+                GridItem() {
+                  Column() {
+                    Text(d.toString()).fontSize(16).fontWeight(this.selectedDay === d ? FontWeight.Bold : FontWeight.Normal).fontColor(this.selectedDay === d ? Color.White : '#333').width(36).height(36).textAlign(TextAlign.Center).backgroundColor(this.selectedDay === d ? '#007DFF' : 'transparent').borderRadius(18)
+                    Row({ space: 2 }) {
+                      if (this.courseMarkers.includes(d)) Circle({ width: 4, height: 4 }).fill('#007DFF')
+                      if (this.inspMarkers.includes(d)) Circle({ width: 4, height: 4 }).fill('#FF9900')
+                    }.height(6)
+                  }.width('100%').height(60).justifyContent(FlexAlign.Start).onClick(() => { this.onDayClick(d) })
+                }
+              })
+            }
+            .columnsTemplate('1fr 1fr 1fr 1fr 1fr 1fr 1fr')
+            .height(this.gridHeight)
+          }.width('100%').padding(15).backgroundColor(Color.White).borderRadius(20).shadow({ radius: 20, color: '#10000000', offsetY: 2 })
+
+          this.ActionButtons()
+          this.OverviewCard()
+          this.TodoCard()
+
+        }
+        .padding({ left: 10, right: 10, bottom: 50 })
+      }
+      .layoutWeight(1)
+
+      // 【仅保留课后分析为 Sheet】(绝不设置 backgroundColor options，防止崩溃)
+      .bindSheet($$this.isShowAnalysisSheet, this.AnalysisSheetBuilder(), {
+        detents: [SheetSize.MEDIUM, SheetSize.LARGE],
+        dragBar: true,
+        backgroundColor: '#F5F7FA',
+        onDisappear: () => { this.isShowAnalysisSheet = false }
+      })
+
+    }.width('100%').height('100%').backgroundColor('#F2F3F5')
+  }
+}
