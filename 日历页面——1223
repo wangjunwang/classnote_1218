@@ -1,0 +1,733 @@
+import { dbHelper, Student, CourseRecord, InspirationRecord, TodoRecord, GroupStat, PeriodStats, CreditStats } from '../db/DBHelper';
+import { common } from '@kit.AbilityKit';
+import { promptAction, curves, window } from '@kit.ArkUI';
+import { Theme } from './AppTheme';
+// 引入其他页面组件
+import { StudentPage } from './StudentPage';
+import { TodoPage } from './TodoPage';
+
+// =======================
+// 0. 基础类型与接口
+// =======================
+interface StudentGroup { name: string; studentIds: number[]; }
+interface DisplayGroup { type: 'group'; date: number; records: CourseRecord[]; }
+interface KnowledgeSummary { type: 'knowledge'; date: number; records: InspirationRecord[]; }
+interface KnowledgePointItem { id: number; content: string; }
+// 分组接口
+interface GroupedKnowledge { chapter: string; points: InspirationRecord[]; }
+interface ChapterStatGroup { chapterName: string; items: GroupStat[]; }
+type ScheduleItem = DisplayGroup | KnowledgeSummary;
+
+// =======================
+// 1. 复用组件 (数据卡片 & 图表)
+// =======================
+@Component
+struct DataCard {
+  @Prop title: string = ''; @Prop value: string = ''; @Prop subText: string = '';
+  icon: Resource = $r('sys.symbol.circle'); color1: string = '#007DFF'; color2: string = '#0055FF';
+  build() {
+    Column() {
+      Row() { Text(this.title).fontSize(14).fontColor('rgba(255,255,255,0.9)'); Blank(); SymbolGlyph(this.icon).fontSize(20).fontColor([Color.White]) }.width('100%').margin({ bottom: 10 })
+      Text(this.value).fontSize(28).fontWeight(FontWeight.Bold).fontColor(Color.White)
+      Text(this.subText).fontSize(12).fontColor('rgba(255,255,255,0.7)').margin({ top: 4 })
+    }
+    .width('100%').height(110).padding(15).linearGradient({ angle: 135, colors: [[this.color1, 0.0], [this.color2, 1.0]] }).borderRadius(24).shadow({ radius: 10, color: this.color2 + '40', offsetY: 5 }).alignItems(HorizontalAlign.Start)
+  }
+}
+
+@Component
+struct NativeBarChart {
+  @Prop @Watch('redraw') data: ChapterStatGroup[]; @Prop totalStudents: number; @State renderTrigger: number = 0; redraw() { this.renderTrigger++; }
+  build() {
+    Column() {
+      if (this.data.length === 0) { Column() { Text('暂无知识点数据').fontSize(14).fontColor(Theme.colors.textSecondary); Text('请在"知识灵感"中添加章节').fontSize(12).fontColor(Theme.colors.textSecondary).margin({top:4}).opacity(0.6) }.width('100%').height(150).justifyContent(FlexAlign.Center) }
+      else {
+        Row() { Text('章节').fontSize(12).fontColor(Theme.colors.textSecondary).width('15%').textAlign(TextAlign.Center); Text('知识点').fontSize(12).fontColor(Theme.colors.textSecondary).width('25%').padding({ left: 5 }); Text('掌握进度').fontSize(12).fontColor(Theme.colors.textSecondary).layoutWeight(1).padding({ left: 10 }); Text('人数').fontSize(12).fontColor(Theme.colors.textSecondary).width(40).textAlign(TextAlign.End) }.width('100%').margin({ bottom: 15 })
+        Column({ space: 0 }) {
+          ForEach(this.data, (group: ChapterStatGroup) => {
+            Row() {
+              Column({ space: 2 }) { ForEach(group.chapterName.split(''), (char: string) => { Text(char).fontSize(12).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary).textAlign(TextAlign.Center).lineHeight(14) }) }.width('15%').padding({ right: 5, top: 10, bottom: 10 }).justifyContent(FlexAlign.Center).border({ width: { right: 1 }, color: Theme.colors.divider })
+              Column({ space: 12 }) {
+                ForEach(group.items, (item: GroupStat) => {
+                  Row() {
+                    Text(item.name).fontSize(13).fontColor(Theme.colors.textPrimary).width('32%').maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Stack({ alignContent: Alignment.Start }) { Row().width('100%').height(8).backgroundColor(Theme.colors.divider).borderRadius(4); Row().width(`${item.count > 0 ? Math.max((item.count / (this.totalStudents || 1)) * 100, 5) : 0}%`).height(8).backgroundColor(item.count === this.totalStudents && item.count > 0 ? '#00AA00' : Theme.colors.accent).borderRadius(4) }.layoutWeight(1).padding({ left: 10, right: 10 })
+                    Text(`${item.count}人`).fontSize(12).fontColor(item.count === 0 ? Theme.colors.textSecondary : Theme.colors.textPrimary).width(40).textAlign(TextAlign.End)
+                  }.width('100%').alignItems(VerticalAlign.Center)
+                })
+              }.layoutWeight(1).padding({ left: 10, top: 10, bottom: 10 })
+            }.width('100%').alignItems(VerticalAlign.Center).border({ width: { bottom: 1 }, color: Theme.colors.divider })
+          })
+        }
+      }
+    }.width('100%').padding(20).backgroundColor(Theme.colors.card).borderRadius(16).shadow({ radius: 10, color: Theme.colors.shadow, offsetY: 2 })
+  }
+}
+
+// =======================
+// 2. 弹窗组件区
+// =======================
+
+// 报表中心
+@CustomDialog
+struct ReportCenterDialog {
+  controller: CustomDialogController; @State weekFinished: number = 0; @State monthFinished: number = 0; @State studentCount: number = 0; @State creditStats: CreditStats = { used: 0, total: 0 }; @State groupedStats: ChapterStatGroup[] = [];
+  async aboutToAppear() { await this.fetchAllData(); }
+  async fetchAllData() {
+    const pStats = await dbHelper.getPeriodStats(); this.weekFinished = pStats.week; this.monthFinished = pStats.month;
+    this.creditStats = await dbHelper.getTotalCreditStats();
+    const students = await dbHelper.getStudents(); this.studentCount = students.length;
+    await this.processKnowledgeData();
+  }
+  async processKnowledgeData() {
+    const start = 0; const end = new Date().getTime() + 31536000000;
+    const allInspirations = await dbHelper.getInspirationsByDate(start, end);
+    const rawStats = await dbHelper.getKnowledgeStats();
+    const statsMap = new Map<string, number>(); rawStats.forEach(s => statsMap.set(s.name, s.count));
+    const structureMap = new Map<string, Set<string>>();
+    allInspirations.forEach(insp => { const ch = insp.chapter || "未分类"; const pt = insp.point || "未知"; if (!structureMap.has(ch)) structureMap.set(ch, new Set()); structureMap.get(ch)?.add(pt); });
+    const result: ChapterStatGroup[] = [];
+    structureMap.forEach((pointSet, chapterName) => { const items: GroupStat[] = []; pointSet.forEach(pointName => items.push({ name: pointName, count: statsMap.get(pointName) || 0, studentNames: [] })); if (items.length > 0) result.push({ chapterName, items }); });
+    this.groupedStats = result.sort((a, b) => a.chapterName.localeCompare(b.chapterName));
+  }
+  build() {
+    Column() {
+      Row() { Text('数据统计').fontSize(24).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary) }.width('100%').padding({ top: 10, bottom: 5 }).justifyContent(FlexAlign.Center).margin({ bottom: 25 })
+      Scroll() {
+        Column({ space: 20 }) {
+          Column() {
+            Row() { SymbolGlyph($r('sys.symbol.clock')).fontSize(20).fontColor([Theme.colors.accent]).margin({ right: 8 }); Text('课时统计').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary) }.width('100%').margin({ bottom: 12 })
+            Grid() {
+              GridItem() { DataCard({ title: '本周消课', value: this.weekFinished.toString(), subText: '节课程', icon: $r('sys.symbol.calendar'), color1: '#007DFF', color2: '#0055FF' }) }
+              GridItem() { DataCard({ title: '本月消课', value: this.monthFinished.toString(), subText: '节课程', icon: $r('sys.symbol.text_aligncenter'), color1: '#FF9900', color2: '#FF7700' }) }
+              GridItem() { DataCard({ title: '总学员', value: this.studentCount.toString(), subText: '人', icon: $r('sys.symbol.person_2_fill'), color1: '#00CC88', color2: '#00AA66' }) }
+              GridItem() { DataCard({ title: '剩余总课时', value: (this.creditStats.total - this.creditStats.used).toString(), subText: '课时', icon: $r('sys.symbol.clock_fill'), color1: '#9900FF', color2: '#7700DD' }) }
+            }.columnsTemplate('1fr 1fr').columnsGap(12).rowsGap(12).height(240)
+          }.width('100%')
+          Column() {
+            Row() { SymbolGlyph($r('sys.symbol.star_fill')).fontSize(20).fontColor(['#FFD700']).margin({ right: 8 }); Text('知识点掌握分布').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary) }.width('100%').margin({ bottom: 15 })
+            NativeBarChart({ data: this.groupedStats, totalStudents: this.studentCount })
+          }.width('100%')
+          Column().height(30)
+        }.width('100%').justifyContent(FlexAlign.Start)
+      }.layoutWeight(1).align(Alignment.Top).scrollBar(BarState.Off)
+    }
+    .width('100%').height('85%').padding(20)
+    // 【修复】背景色改为纯白，去除旧的蓝色
+    .backgroundColor(Color.White)
+    .borderRadius({ topLeft: 24, topRight: 24 }).justifyContent(FlexAlign.Start)
+  }
+}
+
+// 今日详情 - 【修复】背景色 + 知识点
+@CustomDialog
+struct DailyDetailDialog {
+  controller: CustomDialogController; currentDate: Date = new Date(); onDataChanged: () => void = () => {}; onOpenAnalysis: (group: DisplayGroup) => void = () => {}; onAddCourse: () => void = () => {};
+  @State items: ScheduleItem[] = [];
+  @State selectedPointId: number = -1;
+  rescheduleController: CustomDialogController | null = null;
+
+  async aboutToAppear() { await this.refreshLocalData(); }
+
+  async refreshLocalData() {
+    const s = new Date(this.currentDate); s.setHours(0,0,0,0); const e = new Date(this.currentDate); e.setHours(23,59,59,999);
+    const c = await dbHelper.getCoursesByDate(s.getTime(), e.getTime());
+    const i = await dbHelper.getInspirationsByDate(s.getTime(), e.getTime());
+    const map = new Map<number, CourseRecord[]>(); c.forEach(r => { if(!map.has(r.date)) map.set(r.date, []); map.get(r.date)?.push(r); });
+    const groups: DisplayGroup[] = []; map.forEach((recs, date) => groups.push({ type: 'group', date, records: recs }));
+    const finalItems: ScheduleItem[] = [...groups]; if (i.length > 0) finalItems.push({ type: 'knowledge', date: s.getTime(), records: i } as KnowledgeSummary);
+    this.items = finalItems.sort((a, b) => a.date - b.date); this.onDataChanged();
+  }
+
+  // 分组函数
+  groupInspirations(records: InspirationRecord[]): GroupedKnowledge[] {
+    const map = new Map<string, InspirationRecord[]>();
+    records.forEach(r => {
+      const ch = r.chapter || '未分类';
+      if (!map.has(ch)) map.set(ch, []);
+      map.get(ch)?.push(r);
+    });
+    const result: GroupedKnowledge[] = [];
+    map.forEach((points, chapter) => result.push({ chapter, points }));
+    return result.sort((a, b) => a.chapter.localeCompare(b.chapter));
+  }
+
+  showActionMenu(r: CourseRecord) {
+    ActionSheet.show({ title: `${r.studentName} 的课程`, message: '请选择操作', autoCancel: true, alignment: DialogAlignment.Bottom, confirm: { value: '取消', action: () => {} },
+      sheets: [
+        { title: '🗓️ 调课', action: () => { this.rescheduleController = new CustomDialogController({ builder: RescheduleDialog({ courseId: r.id, originalDate: r.date, onConfirm: () => { this.refreshLocalData(); AppStorage.setOrCreate('AppGlobalUpdate', Date.now()); } }), alignment: DialogAlignment.Bottom }); this.rescheduleController.open(); } },
+        { title: '🏖️ 请假', action: async () => { await dbHelper.markAsLeave(r.id); this.refreshLocalData(); AppStorage.setOrCreate('AppGlobalUpdate', Date.now()); } },
+        { title: '❌ 删除', action: async () => { await dbHelper.deleteCourse(r.id); this.refreshLocalData(); AppStorage.setOrCreate('AppGlobalUpdate', Date.now()); } }
+      ]
+    });
+  }
+  async finishGroup(group: DisplayGroup) { for (const r of group.records) { if (r.isFinished === 0 && r.status === 0) await dbHelper.finishCourse(r.id, r.studentId); } this.refreshLocalData(); AppStorage.setOrCreate('AppGlobalUpdate', Date.now()); }
+  formatTime(ts: number): string { const d = new Date(ts); return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`; }
+  getTitleDate(): string { return `${this.currentDate.getMonth() + 1}月${this.currentDate.getDate()}日`; }
+
+  build() {
+    Column() {
+      Row() { Text(this.getTitleDate()).fontSize(24).fontWeight(FontWeight.Bold).margin({ right: 10 }).fontColor(Theme.colors.textPrimary); Divider().vertical(true).height(18).color(Theme.colors.textSecondary).strokeWidth(2).margin({ right: 10 }); Text('今日概览').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary); Blank(); Button('排课').fontSize(12).height(28).backgroundColor('#33CC88').margin({ right: 10 }).onClick(() => { this.onAddCourse() }); Button('收起').fontSize(12).height(28).backgroundColor(Theme.colors.accent).onClick(() => { this.controller.close() }) }.width('100%').margin({ bottom: 20 })
+      if (this.items.length === 0) { Column() { Text('暂无安排').fontColor(Theme.colors.textSecondary) }.width('100%').height(100).justifyContent(FlexAlign.Center) }
+      else {
+        List({ space: 15 }) {
+          ForEach(this.items, (item: ScheduleItem) => {
+            ListItem() {
+              if (item.type === 'group') {
+                Row() {
+                  Divider().vertical(true).height(40).color(Theme.colors.accent).strokeWidth(4).margin({ right: 10 })
+                  Column() { Text('课程').fontSize(14).fontColor(Theme.colors.textPrimary).fontWeight(FontWeight.Bold); Text(this.formatTime(item.date)).fontSize(12).fontColor(Theme.colors.textSecondary).margin({top:4}) }.alignItems(HorizontalAlign.Start).width(60)
+                  Text((item as DisplayGroup).records.map(r => r.studentName).join('、')).fontSize(14).fontWeight(FontWeight.Medium).layoutWeight(1).textAlign(TextAlign.Center).maxLines(1).textOverflow({overflow: TextOverflow.Ellipsis}).fontColor(Theme.colors.textPrimary).onClick(() => { this.showActionMenu((item as DisplayGroup).records[0]) })
+                  Row({ space: 8 }) {
+                    Button('分析').fontSize(10).height(24).backgroundColor(Theme.colors.accentLight).fontColor(Theme.colors.accent).padding({ left: 8, right: 8 }).onClick(() => { this.onOpenAnalysis(item as DisplayGroup); this.controller.close(); })
+                    if ((item as DisplayGroup).records.some(r => r.isFinished === 0 && r.status === 0)) { Button('消课').fontSize(10).height(24).backgroundColor(Theme.colors.accent).padding({ left: 8, right: 8 }).onClick(() => { this.finishGroup(item as DisplayGroup) }) } else { Text('已消课').fontSize(10).fontColor(Theme.colors.textSecondary).backgroundColor(Theme.colors.divider).padding(4).borderRadius(4) }
+                  }.margin({ left: 5 })
+                }.padding({ left: 10, right: 10, top: 12, bottom: 12 }).backgroundColor(Theme.colors.card).borderRadius(12).margin({ left: 5, right: 5 })
+              } else {
+                Column() {
+                  Row() { SymbolGlyph($r('sys.symbol.lightbulb')).fontSize(20).fontColor(['#FF9900']).margin({right:8}); Text('今日知识点').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary) }.width('100%').margin({bottom:10})
+
+                  ForEach(this.groupInspirations((item as KnowledgeSummary).records), (group: GroupedKnowledge) => {
+                    Column() {
+                      // 章节名
+                      Text(group.chapter)
+                        .fontSize(12)
+                        .fontWeight(FontWeight.Bold)
+                        .fontColor(Theme.colors.textSecondary)
+                        .margin({ bottom: 4, top: 8 })
+                        .width('100%')
+
+                      // 知识点气泡
+                      Flex({ wrap: FlexWrap.Wrap }) {
+                        ForEach(group.points, (r: InspirationRecord) => {
+                          Stack({ alignContent: Alignment.TopEnd }) {
+                            Text(r.point)
+                              .fontSize(13)
+                              .fontColor(Theme.colors.textPrimary)
+                              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                              .backgroundColor(Theme.colors.divider)
+                              .borderRadius(16)
+                              .margin({ top: 6, right: 6, bottom: 6 })
+                              .onClick(() => {
+                                this.selectedPointId = (this.selectedPointId === r.id) ? -1 : r.id;
+                              })
+
+                            if (this.selectedPointId === r.id) {
+                              Button({ type: ButtonType.Circle }) {
+                                SymbolGlyph($r('sys.symbol.xmark')).fontSize(10).fontColor([Color.White]).fontWeight(FontWeight.Bold)
+                              }
+                              .width(16).height(16)
+                              .backgroundColor('#FF4444')
+                              .offset({ x: 2, y: -2 })
+                              .onClick(async () => {
+                                await dbHelper.deleteInspiration(r.id);
+                                this.refreshLocalData();
+                                this.selectedPointId = -1;
+                              })
+                              .shadow({ radius: 2, color: 'rgba(0,0,0,0.3)', offsetY: 1 })
+                              .zIndex(10)
+                            }
+                          }
+                          .margin({ right: 8, bottom: 4 })
+                        })
+                      }
+                    }
+                    .alignItems(HorizontalAlign.Start)
+                    .width('100%')
+                    .margin({ bottom: 2 })
+                  })
+                }
+                .width('calc(100% - 10vp)')
+                .padding(15)
+                .backgroundColor(Theme.colors.card)
+                .borderRadius(12)
+                .shadow({ radius: 5, color: Theme.colors.shadow, offsetY: 2 })
+                .margin({ left: 5, right: 5 })
+              }
+            }
+          })
+        }.width('100%').height(400).scrollBar(BarState.Off)
+      }
+    }
+    .width('100%').padding(20)
+    // 【修复】背景色纯白
+    .backgroundColor(Color.White)
+    .borderRadius({ topLeft: 24, topRight: 24 })
+  }
+}
+
+// 待办详情
+@CustomDialog
+struct TodoDetailDialog {
+  controller: CustomDialogController; currentDate: Date = new Date(); onDataChanged: () => void = () => {};
+  @State todos: TodoRecord[] = []; @State unFinishedList: TodoRecord[] = []; @State finishedList: TodoRecord[] = [];
+  addTodoCtrl: CustomDialogController | null = null;
+  async aboutToAppear() { await this.refreshLocalData(); }
+  async refreshLocalData() { const s = new Date(this.currentDate); s.setHours(0,0,0,0); const e = new Date(this.currentDate); e.setHours(23,59,59,999); const all = await dbHelper.getTodosByDate(s.getTime(), e.getTime()); animateTo({ duration: 400, curve: Curve.FastOutSlowIn }, () => { this.todos = all; this.unFinishedList = all.filter(t => t.isFinished === 0); this.finishedList = all.filter(t => t.isFinished === 1); this.onDataChanged(); }); }
+  openAddTodo() { this.addTodoCtrl = new CustomDialogController({ builder: AddTodoDialog({ confirm: async (c) => { await dbHelper.addTodo(this.currentDate.getTime(), c); this.refreshLocalData(); if(this.addTodoCtrl) this.addTodoCtrl.close(); } }), alignment: DialogAlignment.Bottom }); this.addTodoCtrl.open(); }
+  async toggleFinish(t: TodoRecord) { await dbHelper.updateTodoStatus(t.id, t.isFinished === 1 ? 0 : 1); this.refreshLocalData(); }
+  async handleDelete(id: number) { await dbHelper.deleteTodo(id); this.refreshLocalData(); }
+  @Builder SwipeMenu(id: number) { Row() { Button({ type: ButtonType.Circle }) { SymbolGlyph($r('sys.symbol.trash')).fontSize(24).fontColor([Color.White]) }.width(40).height(40).backgroundColor(Color.Red).onClick(() => { this.handleDelete(id) }) }.width(60).justifyContent(FlexAlign.Center) }
+  @Builder GroupHeader(title: string) { Text(title).fontSize(14).fontColor(Theme.colors.textSecondary).width('100%').padding({ top: 12, bottom: 8 }) }
+  @Builder TodoItem(t: TodoRecord) {
+    ListItem() {
+      Row() {
+        Stack() { Circle({ width: 24, height: 24 }).fill(t.isFinished ? Theme.colors.accent : 'transparent').stroke(Theme.colors.accent).strokeWidth(2); if (t.isFinished) SymbolGlyph($r('sys.symbol.checkmark')).fontSize(14).fontColor([Color.White]) }.onClick(() => { this.toggleFinish(t) }).margin({ right: 15 })
+        Text(t.content).fontSize(16).fontColor(t.isFinished ? Theme.colors.textSecondary : Theme.colors.textPrimary).decoration({ type: t.isFinished ? TextDecorationType.LineThrough : TextDecorationType.None, color: t.isFinished ? Theme.colors.textSecondary : Theme.colors.textPrimary }).layoutWeight(1)
+      }.width('100%').padding(15).backgroundColor(Theme.colors.divider).borderRadius(12)
+    }.swipeAction({ end: () => { this.SwipeMenu(t.id) } })
+  }
+  build() {
+    Column() {
+      Row() { Column() { Text('待办事项').fontSize(24).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary); Text(`已完成 ${this.finishedList.length}/${this.todos.length}`).fontSize(12).fontColor(Theme.colors.textSecondary).margin({top:2}) }.alignItems(HorizontalAlign.Start); Blank(); Button('新建').height(36).backgroundColor(Theme.colors.accent).onClick(() => { this.openAddTodo() }) }.width('100%').margin({ bottom: 10 })
+      if (this.todos.length === 0) { Column() { Text('今天没有待办任务').fontColor(Theme.colors.textSecondary) }.width('100%').height(200).justifyContent(FlexAlign.Center) }
+      else {
+        List({ space: 10 }) {
+          if (this.unFinishedList.length > 0) { ListItem() { this.GroupHeader('进行中') }; ForEach(this.unFinishedList, (t: TodoRecord) => { this.TodoItem(t) }, (t: TodoRecord) => t.id.toString()) }
+          if (this.finishedList.length > 0) { ListItem() { this.GroupHeader('已完成') }; ForEach(this.finishedList, (t: TodoRecord) => { this.TodoItem(t) }, (t: TodoRecord) => t.id.toString()) }
+        }.width('100%').height(350).scrollBar(BarState.Off)
+      }
+    }
+    .padding(20)
+    // 【修复】背景色纯白
+    .backgroundColor(Color.White)
+    .borderRadius({ topLeft: 20, topRight: 20 })
+  }
+}
+
+@Component
+struct PostClassAnalysisSheet {
+  @Prop courseDate: number; @Prop records: CourseRecord[]; onClose: () => void = () => {}; @State knowledgePoints: string[] = []; @State students: Student[] = []; @State masteryMatrix: boolean[][] = []
+  async aboutToAppear() {
+    const start = new Date(this.courseDate); start.setHours(0,0,0,0); const end = new Date(this.courseDate); end.setHours(23,59,59,999);
+    const inspirations = await dbHelper.getInspirationsByDate(start.getTime(), end.getTime());
+    const pointsSet = new Set<string>(); inspirations.forEach(ins => { if (ins.point) pointsSet.add(ins.point); }); this.knowledgePoints = Array.from(pointsSet);
+    if (this.records.length > 0) { const allStudents = await dbHelper.getStudents(); const targetIds = this.records.map(r => r.studentId); this.students = allStudents.filter(s => targetIds.includes(s.id)); }
+    if (this.students.length > 0 && this.knowledgePoints.length > 0) {
+      const matrix: boolean[][] = []; for (let i = 0; i < this.students.length; i++) { const row: boolean[] = []; const masteredPoints = await dbHelper.getStudentMastery(this.students[i].id, start.getTime()); for (let j = 0; j < this.knowledgePoints.length; j++) row.push(masteredPoints.includes(this.knowledgePoints[j])); matrix.push(row); } this.masteryMatrix = matrix;
+    }
+  }
+  build() {
+    Column() {
+      Row().width(40).height(5).backgroundColor(Theme.colors.divider).borderRadius(2.5).margin({ top: 10, bottom: 20 })
+      Row() { Column() { Text('课后分析').fontSize(22).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary); Text('标记学员今日掌握的知识点').fontSize(12).fontColor(Theme.colors.textSecondary).margin({ top: 4 }) }.alignItems(HorizontalAlign.Start); Blank(); Button('完成').height(32).fontSize(14).backgroundColor(Theme.colors.accent).onClick(() => { this.onClose() }) }.width('100%').margin({ bottom: 20 })
+      if (this.knowledgePoints.length === 0) { Column() { SymbolGlyph($r('sys.symbol.questionmark_circle')).fontSize(40).fontColor(['#DDDDDD']).margin({ bottom: 10 }); Text('今日未添加知识灵感').fontColor(Theme.colors.textSecondary).fontSize(14) }.height(200).justifyContent(FlexAlign.Center).width('100%') }
+      else {
+        List() {
+          ForEach(this.students, (stu: Student, i: number) => {
+            ListItem() {
+              Column() {
+                Row() { Text(stu.name.substring(0, 1)).fontSize(14).fontWeight(FontWeight.Bold).fontColor(Color.White).width(28).height(28).textAlign(TextAlign.Center).backgroundColor(Theme.colors.accent).borderRadius(14).margin({ right: 10 }); Text(stu.name).fontSize(16).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary) }.width('100%').margin({ bottom: 12 })
+                Divider().color(Theme.colors.divider).margin({ bottom: 12 })
+                Flex({ wrap: FlexWrap.Wrap }) {
+                  ForEach(this.knowledgePoints, (p: string, j: number) => {
+                    Row() { if (this.masteryMatrix[i] && this.masteryMatrix[i][j]) SymbolGlyph($r('sys.symbol.checkmark')).fontSize(12).fontColor([Color.White]).margin({ right: 4 }); Text(p).fontSize(12).fontColor((this.masteryMatrix[i] && this.masteryMatrix[i][j]) ? Color.White : '#666') }
+                    .padding({ left: 12, right: 12, top: 6, bottom: 6 }).backgroundColor((this.masteryMatrix[i] && this.masteryMatrix[i][j]) ? Theme.colors.accent : Theme.colors.divider).borderRadius(16).margin({ right: 8, bottom: 8 }).onClick(async () => { const newRow = [...this.masteryMatrix[i]]; newRow[j] = !newRow[j]; this.masteryMatrix[i] = newRow; this.masteryMatrix = [...this.masteryMatrix]; const start = new Date(this.courseDate); start.setHours(0,0,0,0); await dbHelper.updateMastery(this.students[i].id, start.getTime(), this.knowledgePoints[j], newRow[j]); })
+                  })
+                }
+              }.width('100%').padding(15).backgroundColor(Theme.colors.card).borderRadius(16).shadow({ radius: 8, color: '#0A000000', offsetY: 2 }).margin({ bottom: 15 })
+            }
+          })
+        }.width('100%').layoutWeight(1).scrollBar(BarState.Off)
+      }
+    }
+    .width('100%').height('100%').padding({ left: 20, right: 20, bottom: 20 })
+    // 【修复】背景色纯白
+    .backgroundColor(Color.White)
+  }
+}
+
+// =======================
+// 输入框修复版
+// =======================
+@CustomDialog
+struct AddKnowledgeDialog {
+  controller: CustomDialogController; confirm: (chapter: string, points: string[]) => void = () => {}; @State chapter: string = ''; @State p1: string = ''; @State p2: string = ''; @State p3: string = ''; @State p4: string = ''
+
+  @Builder InputField(placeholder: string, text: string, onChange: (v: string) => void) {
+    TextInput({ placeholder: placeholder, text: text })
+      .onChange(onChange)
+      .backgroundColor('#F5F7FA') // 强制浅灰背景
+      .fontColor('#1A1A1A')       // 强制深黑文字
+      .placeholderColor('#999999')
+      .height(50)
+      .borderRadius(12)
+  }
+
+  build() {
+    Column({ space: 15 }) {
+      Row().width(40).height(5).backgroundColor(Theme.colors.divider).borderRadius(2.5).margin({ top: 10, bottom: 10 })
+      Row() { Text('今日知识灵感').fontSize(22).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary); Blank(); Button('保存').height(32).backgroundColor('#FF9900').onClick(() => { const pts: string[] = [this.p1, this.p2, this.p3, this.p4].filter(p => p.trim() !== ''); if (this.chapter && pts.length > 0) { this.confirm(this.chapter, pts); this.controller.close(); } else { promptAction.showToast({ message: '请完整填写章节和知识点' }) } }) }.width('100%').margin({ bottom: 10 })
+
+      this.InputField('知识章节 (如：第一章 乐理基础)', this.chapter, (v) => this.chapter = v)
+      this.InputField('知识点 1', this.p1, (v) => this.p1 = v)
+      this.InputField('知识点 2', this.p2, (v) => this.p2 = v)
+      this.InputField('知识点 3', this.p3, (v) => this.p3 = v)
+      this.InputField('知识点 4', this.p4, (v) => this.p4 = v)
+
+      Button('取消').width('100%').height(45).backgroundColor('transparent').fontColor(Theme.colors.textSecondary).onClick(() => this.controller.close())
+    }
+    .padding(20).backgroundColor(Theme.colors.card)
+    .width('100%').borderRadius({ topLeft: 24, topRight: 24 })
+  }
+}
+
+@CustomDialog
+struct RescheduleDialog {
+  controller: CustomDialogController; courseId: number = 0; originalDate: number = 0; onConfirm: () => void = () => {}
+  @State selectedDate: Date = new Date(); aboutToAppear() { this.selectedDate = new Date(this.originalDate); }
+  build() {
+    Column() {
+      Text('课程调整').fontSize(18).fontWeight(FontWeight.Bold).margin({ bottom: 20 }).fontColor(Theme.colors.textPrimary)
+      DatePicker({ start: new Date(), selected: this.selectedDate }).onChange((v: DatePickerResult) => { if(v.year&&v.month&&v.day) this.selectedDate.setFullYear(v.year,v.month,v.day) })
+      TimePicker({ selected: this.selectedDate }).onChange((v: TimePickerResult) => { if(v.hour!==undefined&&v.minute!==undefined) this.selectedDate.setHours(v.hour,v.minute) })
+      Row({ space: 20 }) { Button('取消').layoutWeight(1).backgroundColor(Theme.colors.divider).fontColor(Theme.colors.textSecondary).onClick(() => this.controller.close()); Button('确认').layoutWeight(1).backgroundColor(Theme.colors.accent).onClick(async () => { await dbHelper.rescheduleCourse(this.courseId, this.selectedDate.getTime()); this.onConfirm(); this.controller.close(); }) }.width('100%').margin({ top: 20 })
+    }
+    .padding(20).backgroundColor(Theme.colors.card) // 【修复】背景纯白
+    .borderRadius(20)
+  }
+}
+
+@CustomDialog
+struct AddCourseDialog {
+  controller: CustomDialogController; students: Student[] = []; groups: StudentGroup[] = []; confirm: (sids: number[], h: number, m: number, note: string) => void = () => {}
+  @State selectedSids: number[] = []; @State note: string = ''; @State hour: string = '10'; @State min: string = '00'; @State hours: string[] = []; @State mins: string[] = []; @State currentGroupName: string = '';
+  aboutToAppear() { for(let i=0;i<24;i++) this.hours.push(i.toString().padStart(2,'0')); for(let i=0;i<60;i++) this.mins.push(i.toString().padStart(2,'0')); }
+  toggleGroup(g: StudentGroup) { if (this.currentGroupName === g.name) { this.selectedSids = []; this.currentGroupName = ''; } else { this.selectedSids = [...g.studentIds]; this.currentGroupName = g.name; } }
+  toggleStudent(id: number) { if (this.selectedSids.includes(id)) { this.selectedSids = this.selectedSids.filter(s => s !== id); } else { this.selectedSids.push(id); } this.currentGroupName = ''; }
+  build() {
+    Column({ space: 15 }) {
+      Text('安排课程').fontSize(20).fontWeight(FontWeight.Bold).margin({ top: 5 }).fontColor(Theme.colors.textPrimary)
+      if (this.groups.length > 0) { Column({ space: 8 }) { Text('快捷分组').fontSize(14).fontColor(Theme.colors.textSecondary).width('100%'); List({ space: 10 }) { ForEach(this.groups, (g: StudentGroup) => { ListItem() { Text(g.name).fontSize(12).fontColor(this.currentGroupName === g.name ? Color.White : Theme.colors.accent).padding({ left: 12, right: 12, top: 6, bottom: 6 }).backgroundColor(this.currentGroupName === g.name ? Theme.colors.accent : Theme.colors.divider).borderRadius(16).onClick(() => this.toggleGroup(g)) } }) }.listDirection(Axis.Horizontal).width('100%').height(35).scrollBar(BarState.Off) }.width('100%') }
+      Text('选择学生').fontSize(14).fontColor(Theme.colors.textSecondary).width('100%')
+      Grid() { ForEach(this.students, (s: Student) => { GridItem() { Text(s.name).fontSize(14).fontColor(this.selectedSids.includes(s.id) ? Color.White : Theme.colors.textPrimary).textAlign(TextAlign.Center).width('100%').padding({ top: 6, bottom: 6 }).backgroundColor(this.selectedSids.includes(s.id) ? Theme.colors.accent : Theme.colors.divider).borderRadius(8).onClick(() => { this.toggleStudent(s.id) }) } }) }.columnsTemplate('1fr 1fr 1fr 1fr').columnsGap(8).rowsGap(8).height(100)
+      Column({ space: 5 }) { Text('上课时间').fontSize(14).fontColor(Theme.colors.textSecondary).width('100%'); Row() { TextPicker({ range: this.hours, selected: 10 }).onChange((v: string | string[]) => this.hour = (Array.isArray(v) ? v[0] : v)).layoutWeight(1).height(50); Text(':').fontSize(20).fontColor(Theme.colors.textPrimary); TextPicker({ range: this.mins, selected: 0 }).onChange((v: string | string[]) => this.min = (Array.isArray(v) ? v[0] : v)).layoutWeight(1).height(50); }.width('100%') }.width('100%')
+      TextInput({ placeholder: '备注', text: this.note }).onChange((v: string) => this.note = v).backgroundColor(Theme.colors.divider).height(45).borderRadius(8)
+      Row({ space: 20 }) { Button('取消').layoutWeight(1).backgroundColor(Theme.colors.divider).fontColor(Theme.colors.textSecondary).onClick(() => this.controller.close()); Button('确定').layoutWeight(1).backgroundColor(Theme.colors.accent).onClick(() => { this.confirm(this.selectedSids, parseInt(this.hour), parseInt(this.min), this.note); AppStorage.setOrCreate('AppGlobalUpdate', Date.now()); }) }.width('100%')
+    }
+    .padding(25).backgroundColor(Theme.colors.card) // 【修复】背景纯白
+    .borderRadius({ topLeft: 24, topRight: 24 })
+  }
+}
+
+@CustomDialog
+struct AddTodoDialog {
+  controller: CustomDialogController; confirm: (content: string) => void = () => {}; @State content: string = ''
+  build() {
+    Column({ space: 20 }) {
+      Text('新建待办').fontSize(20).fontWeight(FontWeight.Bold).margin({ top: 10 }).fontColor(Theme.colors.textPrimary)
+      TextInput({ placeholder: '内容', text: this.content }).onChange((v: string) => this.content = v).backgroundColor(Theme.colors.divider).height(50).borderRadius(8)
+      Row({ space: 20 }) { Button('取消').layoutWeight(1).backgroundColor(Theme.colors.divider).fontColor(Theme.colors.textSecondary).onClick(() => { this.controller.close() }); Button('保存').layoutWeight(1).backgroundColor(Theme.colors.accent).onClick(() => { if (this.content) this.confirm(this.content); }) }.width('100%')
+    }
+    .padding(25).backgroundColor(Theme.colors.card) // 【修复】背景纯白
+    .borderRadius(16)
+  }
+}
+
+// =======================
+// 10. 主页面 (CalendarPage) - 完整功能版
+// =======================
+@Entry
+@Component
+export struct CalendarPage {
+  @State currentYear: number = new Date().getFullYear();
+  @State currentMonth: number = new Date().getMonth() + 1;
+  @State selectedDay: number = new Date().getDate();
+  @State daysInMonth: number[] = [];
+  @State startWeekDay: number = 0;
+  @State courseMarkers: number[] = [];
+  @State inspMarkers: number[] = []; // 这里虽然叫 inspMarkers 但实际上我们会存 Todo 的标记
+  @State todayCoursesCount: number = 0;
+  @State todayTodosCount: number = 0;
+  @State gridHeight: number = 300;
+  @State isShowAnalysisSheet: boolean = false;
+  @State currentAnalysisRecords: CourseRecord[] = [];
+  @State currentAnalysisDate: number = 0;
+  @StorageProp('AppGlobalUpdate') @Watch('refreshData') updateSignal: number = 0;
+  @StorageLink('GlobalShortcutAction') @Watch('onShortcutTrigger') shortcutAction: string = '';
+
+  // Tab 控制 (0:日程, 1:学员, 2:待办)
+  @State currentTabIndex: number = 0;
+
+  todoController: CustomDialogController | null = null;
+  directAddCourseController: CustomDialogController | null = null;
+  reportController: CustomDialogController | null = null;
+  detailController: CustomDialogController | null = null;
+  knowledgeController: CustomDialogController | null = null;
+
+  async aboutToAppear() {
+    let context = getContext(this) as common.UIAbilityContext;
+    await dbHelper.initDB(context);
+    this.initCalendar();
+    this.refreshData();
+    this.onShortcutTrigger();
+  }
+  onPageShow() { this.refreshData(); this.onShortcutTrigger(); }
+  async showAddCourseDialog(targetDate?: Date) {
+    const students = await dbHelper.getStudents();
+    const groups: StudentGroup[] = []; const map = new Map<string, number[]>();
+    students.forEach(s => { const g = s.groupName || '默认'; if (!map.has(g)) map.set(g, []); map.get(g)?.push(s.id); });
+    if (students.length > 1) groups.push({ name: '全员', studentIds: students.map(s => s.id) }); map.forEach((ids, name) => { if (ids.length > 0) groups.push({ name, studentIds: ids }); });
+    this.directAddCourseController = new CustomDialogController({ builder: AddCourseDialog({ students, groups, confirm: async (sids, h, m, note) => { const d = targetDate ? new Date(targetDate) : new Date(); d.setHours(h, m, 0, 0); for(const sid of sids) await dbHelper.addCourse(sid, d.getTime(), note); this.refreshData(); AppStorage.setOrCreate('AppGlobalUpdate', Date.now()); if(this.directAddCourseController) this.directAddCourseController.close(); } }), alignment: DialogAlignment.Bottom, customStyle: true });
+    this.directAddCourseController.open();
+  }
+  async onShortcutTrigger() { if (!this.shortcutAction) return; if (this.shortcutAction === 'action_add_course') { setTimeout(() => { this.showAddCourseDialog(); AppStorage.setOrCreate('GlobalShortcutAction', ''); }, 200); } }
+  openAddCourse() { this.showAddCourseDialog(); }
+  openReportCenter() { this.reportController = new CustomDialogController({ builder: ReportCenterDialog(), alignment: DialogAlignment.Bottom, customStyle: true }); this.reportController.open(); }
+  openAddKnowledge() { this.knowledgeController = new CustomDialogController({ builder: AddKnowledgeDialog({ confirm: async (chapter, points) => { const d = new Date(this.currentYear, this.currentMonth - 1, this.selectedDay); for(const p of points) await dbHelper.addKnowledgeInspiration(d.getTime(), chapter, p); this.refreshData(); } }), alignment: DialogAlignment.Bottom, customStyle: true }); this.knowledgeController.open(); }
+  initCalendar() { const d = new Date(this.currentYear, this.currentMonth - 1, 1); this.startWeekDay = d.getDay(); const lastDay = new Date(this.currentYear, this.currentMonth, 0).getDate(); const rows = Math.ceil((this.startWeekDay + lastDay) / 7); this.gridHeight = rows * 60; const arr: number[] = []; for(let i=1; i<=lastDay; i++) arr.push(i); this.daysInMonth = arr; }
+
+  async refreshData() {
+    const m = await dbHelper.getMonthMarkers(this.currentYear, this.currentMonth);
+    this.courseMarkers = m.courses;
+
+    // 【修复】橙色点改为显示“待办事项”
+    // 获取当月所有待办，如果有未完成的，标记该天
+    const start = new Date(this.currentYear, this.currentMonth - 1, 1).getTime();
+    const end = new Date(this.currentYear, this.currentMonth, 0, 23, 59, 59).getTime();
+    const todos = await dbHelper.getTodosByDate(start, end);
+    const todoDays = new Set<number>();
+    todos.forEach(t => {
+      if (t.isFinished === 0) { // 仅标记未完成
+        todoDays.add(new Date(t.date).getDate());
+      }
+    });
+    this.inspMarkers = Array.from(todoDays); // 复用 inspMarkers 变量存储待办红点
+
+    const s = new Date(this.currentYear, this.currentMonth - 1, this.selectedDay); const c = await dbHelper.getCoursesByDate(s.getTime(), s.getTime() + 86399999); this.todayCoursesCount = c.length;
+    const tStart = new Date(this.selectedDay); tStart.setHours(0,0,0,0); const tEnd = new Date(this.selectedDay); tEnd.setHours(23,59,59,999); const todosToday = await dbHelper.getTodosByDate(tStart.getTime(), tEnd.getTime()); this.todayTodosCount = todosToday.filter(t => t.isFinished === 0).length;
+  }
+
+  handlePrevMonth() { let y = this.currentYear, m = this.currentMonth - 1; if (m < 1) { y--; m = 12; } this.currentYear = y; this.currentMonth = m; this.initCalendar(); this.refreshData(); }
+  handleNextMonth() { let y = this.currentYear, m = this.currentMonth + 1; if (m > 12) { y++; m = 1; } this.currentYear = y; this.currentMonth = m; this.initCalendar(); this.refreshData(); }
+  onDayClick(d: number) {
+    this.selectedDay = d;
+    this.refreshData().then(() => {
+      this.detailController = new CustomDialogController({ builder: DailyDetailDialog({ currentDate: new Date(this.currentYear, this.currentMonth - 1, this.selectedDay), onDataChanged: () => { this.refreshData(); }, onOpenAnalysis: (group) => { const targetDate = new Date(this.currentYear, this.currentMonth - 1, this.selectedDay); this.currentAnalysisDate = targetDate.getTime(); this.currentAnalysisRecords = group.records; setTimeout(() => { this.isShowAnalysisSheet = true; }, 50); }, onAddCourse: () => { if (this.detailController) { this.detailController.close(); } const targetDate = new Date(this.currentYear, this.currentMonth - 1, this.selectedDay); this.showAddCourseDialog(targetDate); } }), alignment: DialogAlignment.Bottom, customStyle: true });
+      this.detailController.open();
+    });
+  }
+  openTodoDialog() { this.todoController = new CustomDialogController({ builder: TodoDetailDialog({ currentDate: new Date(this.currentYear, this.currentMonth - 1, this.selectedDay), onDataChanged: () => { this.refreshData(); } }), alignment: DialogAlignment.Bottom, customStyle: true }); this.todoController.open(); }
+
+  // 1. 橙色概览大卡片 (Hero Card) - 统一圆角24
+  @Builder HeroCard() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Circle({ width: 120, height: 120 }).fill('rgba(255,255,255,0.1)').position({ x: -30, y: -30 })
+      Circle({ width: 80, height: 80 }).fill('rgba(255,255,255,0.1)').position({ x: '80%', y: '60%' })
+      Column() {
+        Row() {
+          Text('今日概览').fontSize(16).fontWeight(FontWeight.Bold).fontColor(Color.White)
+          Blank()
+          Text(`${this.currentMonth}月${this.selectedDay}日`).fontSize(12).fontColor('rgba(255,255,255,0.9)').backgroundColor('rgba(0,0,0,0.1)').padding({left:8, right:8, top:4, bottom:4}).borderRadius(10)
+        }.width('100%')
+        Text(`${this.todayCoursesCount} 节课程 · ${this.todayTodosCount} 个待办`).fontSize(13).fontColor('rgba(255,255,255,0.9)').margin({ top: 4 })
+      }.alignItems(HorizontalAlign.Start).width('100%').height('100%')
+    }
+    // 【修复】统一圆角半径为 24
+    .width('100%').height(100).padding(20).linearGradient({ angle: 135, colors: [['#FF8800', 0.0], ['#FFBB00', 1.0]] }).borderRadius(24).shadow({ radius: 20, color: '#50FF8800', offsetY: 10 })
+    .onClick(() => {
+      const t = new Date();
+      this.selectedDay = t.getDate();
+      this.onDayClick(t.getDate());
+    })
+  }
+
+  // 2. 1x4 功能入口行 - 统一圆角24，橙色系
+  @Builder FunctionRow() {
+    Row({ space: 10 }) {
+      // 1. 排课
+      Column() {
+        Stack({ alignContent: Alignment.Center }) {
+          Circle({ width: 44, height: 44 }).fill('rgba(255,255,255,0.2)')
+          SymbolGlyph($r('sys.symbol.calendar_badge_plus')).fontSize(22).fontColor([Color.White])
+        }.margin({ bottom: 6 })
+        Text('快速排课').fontSize(12).fontWeight(FontWeight.Medium).fontColor(Color.White)
+      }.layoutWeight(1).onClick(() => this.openAddCourse())
+
+      // 2. 灵感
+      Column() {
+        Stack({ alignContent: Alignment.Center }) {
+          Circle({ width: 44, height: 44 }).fill('rgba(255,255,255,0.2)')
+          SymbolGlyph($r('sys.symbol.lightbulb')).fontSize(22).fontColor([Color.White])
+        }.margin({ bottom: 6 })
+        Text('知识灵感').fontSize(12).fontWeight(FontWeight.Medium).fontColor(Color.White)
+      }.layoutWeight(1).onClick(() => this.openAddKnowledge())
+
+      // 3. 待办
+      Column() {
+        Stack({ alignContent: Alignment.Center }) {
+          Circle({ width: 44, height: 44 }).fill('rgba(255,255,255,0.2)')
+          SymbolGlyph($r('sys.symbol.list_bullet')).fontSize(22).fontColor([Color.White])
+        }.margin({ bottom: 6 })
+        Text('待办事项').fontSize(12).fontWeight(FontWeight.Medium).fontColor(Color.White)
+      }.layoutWeight(1).onClick(() => this.openTodoDialog())
+
+      // 4. 分析
+      Column() {
+        Stack({ alignContent: Alignment.Center }) {
+          Circle({ width: 44, height: 44 }).fill('rgba(255,255,255,0.2)')
+          SymbolGlyph($r('sys.symbol.doc_plaintext')).fontSize(22).fontColor([Color.White])
+        }.margin({ bottom: 6 })
+        Text('学情分析').fontSize(12).fontWeight(FontWeight.Medium).fontColor(Color.White)
+      }.layoutWeight(1).onClick(() => this.openReportCenter())
+
+    }
+    // 【修复】宽度撑满，圆角 24，橙色渐变
+    .width('100%')
+    .padding({ top: 15, bottom: 15 })
+    .linearGradient({ angle: 90, colors: [['#FF9F40', 0.0], ['#FFC880', 1.0]] })
+    .borderRadius(24)
+    .shadow({ radius: 15, color: '#40FF9F40', offsetY: 5 })
+  }
+
+  // 3. 悬浮 Dock 栏 (底部导航)
+  @Builder FloatingDock() {
+    Row() {
+      // 1. 日程 Tab
+      this.DockItem($r('sys.symbol.calendar'), '日程', 0)
+
+      // 2. 学员 Tab
+      this.DockItem($r('sys.symbol.person_2_fill'), '学员', 1)
+
+      // 3. 待办 Tab
+      this.DockItem($r('sys.symbol.list_bullet'), '待办', 2)
+    }
+    .width('65%') // 胶囊宽度
+    .height(64)
+    .backgroundColor('rgba(255,255,255,0.85)') // 半透明白底
+    .backdropBlur(20) // 毛玻璃
+    .borderRadius(32) // 圆角
+    .shadow({ radius: 20, color: 'rgba(0,0,0,0.1)', offsetY: 5 })
+    .justifyContent(FlexAlign.SpaceEvenly)
+    // 【修复】距离底部 15vp
+    .margin({ bottom: 15 })
+  }
+
+  @Builder DockItem(icon: Resource, text: string, index: number) {
+    Column() {
+      SymbolGlyph(icon)
+        .fontSize(24)
+        .fontColor(this.currentTabIndex === index ? [Theme.colors.accent] : ['#999999'])
+        .animation({ duration: 300, curve: Curve.FastOutSlowIn })
+
+      Text(text)
+        .fontSize(10)
+        .fontColor(this.currentTabIndex === index ? Theme.colors.accent : '#999999')
+        .margin({ top: 4 })
+    }
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .width(60)
+    .onClick(() => {
+      animateTo({ duration: 300, curve: Curve.FastOutSlowIn }, () => {
+        this.currentTabIndex = index;
+      })
+    })
+  }
+
+  @Builder CalendarView() {
+    Column() {
+      // 日期头 + 星期
+      Column() {
+        Row() {
+          SymbolGlyph($r('sys.symbol.chevron_left')).fontSize(20).fontColor([Theme.colors.textSecondary]).onClick(() => { this.handlePrevMonth() }).padding(10)
+          Text(`${this.currentYear}年 ${this.currentMonth}月`).fontSize(18).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary)
+          SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(20).fontColor([Theme.colors.textSecondary]).onClick(() => { this.handleNextMonth() }).padding(10)
+        }.width('100%').justifyContent(FlexAlign.Center).margin({bottom: 10})
+
+        Row() {
+          ForEach(['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'], (d: string) => {
+            Text(d).fontSize(12).fontWeight(FontWeight.Bold).fontColor(Theme.colors.textPrimary).opacity(0.6).layoutWeight(1).textAlign(TextAlign.Center)
+          })
+        }.width('100%').margin({ bottom: 10 })
+      }
+
+      Grid() {
+        ForEach(Array(this.startWeekDay).fill(0), (item: number) => { GridItem() })
+        ForEach(this.daysInMonth, (d: number) => {
+          GridItem() {
+            Column() {
+              Text(d.toString()).fontSize(16).fontWeight(this.selectedDay === d ? FontWeight.Bold : FontWeight.Normal).fontColor(this.selectedDay === d ? Color.White : Theme.colors.textPrimary).width(36).height(36).textAlign(TextAlign.Center).backgroundColor(this.selectedDay === d ? Theme.colors.accent : 'transparent').borderRadius(18)
+              Row({ space: 2 }) {
+                // 蓝点：课程
+                if (this.courseMarkers.includes(d)) Circle({ width: 4, height: 4 }).fill(Theme.colors.accent)
+                // 【修复】橙点：待办
+                if (this.inspMarkers.includes(d)) Circle({ width: 4, height: 4 }).fill('#FF9900')
+              }.height(6)
+            }.width('100%').height(60).justifyContent(FlexAlign.Start).onClick(() => { this.onDayClick(d) })
+          }
+        })
+      }.columnsTemplate('1fr 1fr 1fr 1fr 1fr 1fr 1fr').height(this.gridHeight)
+    }
+    // 【修复】日历卡片圆角统一为 24
+    .width('100%').padding(15).backgroundColor(Theme.colors.card).borderRadius(24).shadow({ radius: 20, color: Theme.colors.shadow, offsetY: 2 })
+  }
+
+  @Builder AnalysisSheetBuilder() {
+    PostClassAnalysisSheet({
+      courseDate: this.currentAnalysisDate,
+      records: this.currentAnalysisRecords,
+      onClose: () => {
+        this.isShowAnalysisSheet = false;
+      }
+    })
+  }
+
+  // 4. 首页视图 (HomeView) - 【修复】间距设为 12
+  @Builder HomeView() {
+    Column() {
+      // 标题栏
+      Text("课时记")
+        .fontSize(26)
+        .fontWeight(FontWeight.Bold)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .padding({ top: 60, bottom: 10 })
+        .backgroundColor('transparent')
+        .fontColor(Theme.colors.textPrimary)
+
+      Column({ space: 12 }) { // 【修复】间距设为 12
+        this.CalendarView()
+        this.HeroCard()
+        this.FunctionRow()
+        Blank().height(80) // 底部垫高，防遮挡
+      }
+      .padding({ left: 20, right: 20 })
+      .width('100%')
+    }
+  }
+
+  build() {
+    // 使用 Stack 实现内容层与悬浮层分离
+    Stack({ alignContent: Alignment.Bottom }) {
+
+      // 1. 内容层
+      Column() {
+        // 页面切换逻辑
+        if (this.currentTabIndex === 0) {
+          Scroll() { this.HomeView() }.scrollBar(BarState.Off)
+        } else if (this.currentTabIndex === 1) {
+          StudentPage() // 引用学员页
+        } else if (this.currentTabIndex === 2) {
+          TodoPage() // 引用待办页
+        }
+      }
+      .width('100%')
+      .height('100%')
+      .alignItems(HorizontalAlign.Start)
+
+      // 2. 悬浮 Dock 层 (最上层)
+      this.FloatingDock()
+    }
+    .width('100%')
+    .height('100%')
+    // 【背景修复】暖白 -> 极简灰 渐变，与橙色更搭
+    .linearGradient({ angle: 180, colors: [['#FEF9F5', 0.0], ['#F2F3F5', 1.0]] })
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+
+    // 绑定 Sheet
+    .bindSheet($$this.isShowAnalysisSheet, this.AnalysisSheetBuilder(), {
+      detents: [SheetSize.MEDIUM, SheetSize.LARGE], dragBar: true, showClose: false, backgroundColor: Theme.colors.bg, onDisappear: () => { this.isShowAnalysisSheet = false }
+    })
+  }
+}
