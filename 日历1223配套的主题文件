@@ -1,0 +1,66 @@
+// entry/src/main/ets/pages/AppTheme.ets
+
+// 1. 定义颜色接口 (修复：补全所有缺失的颜色属性)
+export interface ThemeColors {
+  bg: string;
+  bgGradientStart: string;
+  bgGradientEnd: string;
+  card: string;
+  textPrimary: string;
+  textSecondary: string;
+  accent: string;
+  accentLight: string;
+  divider: string;
+  shadow: string;
+
+  // 【新增】补全功能网格所需的颜色
+  blueAccent: string;
+  blueLight: string;
+  greenAccent: string;
+  greenLight: string;
+  purpleAccent: string;
+  purpleLight: string;
+}
+
+// 2. 定义布局接口
+export interface ThemeLayout {
+  radius: number;
+  cardPadding: number;
+}
+
+// 3. 主题配置接口
+export interface ThemeConfig {
+  colors: ThemeColors;
+  layout: ThemeLayout;
+}
+
+// 4. 导出主题
+export const Theme: ThemeConfig = {
+  colors: {
+    bg: '#E0F2FF',
+    bgGradientStart: '#F5FCFF',
+    bgGradientEnd: '#E0F2FF',
+
+    card: '#FFFFFF',
+    textPrimary: '#1F2937',
+    textSecondary: '#94A3B8',
+
+    accent: '#FF8800',     // 活力橙
+    accentLight: '#FFF5EB',
+
+    // 【新增】补全颜色值
+    blueAccent: '#3B82F6',
+    blueLight: '#EFF6FF',
+    greenAccent: '#10B981',
+    greenLight: '#ECFDF5',
+    purpleAccent: '#8B5CF6',
+    purpleLight: '#F5F3FF',
+
+    divider: '#F1F5F9',
+    shadow: 'rgba(59, 130, 246, 0.05)'
+  },
+  layout: {
+    radius: 24,
+    cardPadding: 20
+  }
+};
